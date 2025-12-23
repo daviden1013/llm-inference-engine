@@ -625,12 +625,18 @@ class AzureOpenAIInferenceEngine(OpenAIInferenceEngine):
         max_requests_per_minute : int, Optional
             maximum number of requests per minute to the LLM.
         """
+        InferenceEngine.__init__(self, config=config, 
+                                 max_concurrent_requests=max_concurrent_requests, 
+                                 max_requests_per_minute=max_requests_per_minute)
+
+        if importlib.util.find_spec("openai") is None:
+            raise ImportError("OpenAI Python API library not found. Please install OpanAI (```pip install openai```).")
+        
+        from openai import AzureOpenAI, AsyncAzureOpenAI
         self.api_version = api_version
-        super().__init__(model=model, config=config, 
-                         max_concurrent_requests=max_concurrent_requests, 
-                         max_requests_per_minute=max_requests_per_minute, 
-                         api_version=api_version, 
-                         **kwrs)
+        self.client = AzureOpenAI(api_version=api_version, **kwrs)
+        self.async_client = AsyncAzureOpenAI(api_version=api_version, **kwrs)
+        self.model = model
 
 
 class LiteLLMInferenceEngine(InferenceEngine):
