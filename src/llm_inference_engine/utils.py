@@ -92,11 +92,17 @@ class SlideWindowRateLimiter(RateLimiter):
 
 
 class MessagesLogger:
-    def __init__(self):
+    def __init__(self, store_images: bool = False):
         """
         This class is used to log the messages for InferenceEngine.chat().
+
+        Parameters:
+        -----------
+        store_images : bool
+            Whether to store images in the log or not. If False, image URLs will be replaced with a placeholder "[image]".
         """
         self.messages_log = []
+        self.store_images = store_images
 
     def log_messages(self, messages : List[Dict[str,str]]):
         """

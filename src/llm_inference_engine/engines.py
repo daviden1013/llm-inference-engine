@@ -172,6 +172,12 @@ class OllamaInferenceEngine(InferenceEngine):
                 res_dict = self.config.postprocess_response(res)
                 # Write to messages log
                 if messages_logger:
+                    # replace images content with a placeholder "[image]" to save space
+                    if not messages_logger.store_images:
+                        for messages in processed_messages:
+                            if "images" in messages:
+                                messages["images"] = ["[image]" for _ in messages["images"]]
+
                     processed_messages.append({"role": "assistant",
                                                 "content": res_dict.get("response", ""),
                                                 "reasoning": res_dict.get("reasoning", "")})
@@ -229,6 +235,12 @@ class OllamaInferenceEngine(InferenceEngine):
         res_dict = self.config.postprocess_response(res)
         # Write to messages log
         if messages_logger:
+            # replace images content with a placeholder "[image]" to save space
+            if not messages_logger.store_images:
+                for messages in processed_messages:
+                    if "images" in messages:
+                        messages["images"] = ["[image]" for _ in messages["images"]]
+
             processed_messages.append({"role": "assistant", 
                                     "content": res_dict.get("response", ""), 
                                     "reasoning": res_dict.get("reasoning", "")})
@@ -267,6 +279,12 @@ class OllamaInferenceEngine(InferenceEngine):
             res_dict = self.config.postprocess_response(res)
             # Write to messages log
             if messages_logger:
+                # replace images content with a placeholder "[image]" to save space
+                if not messages_logger.store_images:
+                    for messages in processed_messages:
+                        if "images" in messages:
+                            messages["images"] = ["[image]" for _ in messages["images"]]
+
                 processed_messages.append({"role": "assistant", 
                                             "content": res_dict.get("response", ""), 
                                             "reasoning": res_dict.get("reasoning", "")})
@@ -366,6 +384,14 @@ class HuggingFaceHubInferenceEngine(InferenceEngine):
                 res_dict = self.config.postprocess_response(res_text)
                 # Write to messages log
                 if messages_logger:
+                    # replace images content with a placeholder "[image]" to save space
+                    if not messages_logger.store_images:
+                        for messages in processed_messages:
+                            if "content" in messages and isinstance(messages["content"], list):
+                                for content in messages["content"]:
+                                    if isinstance(content, dict) and content.get("type") == "image_url":
+                                        content["image_url"]["url"] = "[image]"
+
                     processed_messages.append({"role": "assistant",
                                                 "content": res_dict.get("response", ""),
                                                 "reasoning": res_dict.get("reasoning", "")})
@@ -400,9 +426,17 @@ class HuggingFaceHubInferenceEngine(InferenceEngine):
         res_dict = self.config.postprocess_response(res)
         # Write to messages log
         if messages_logger:
+            # replace images content with a placeholder "[image]" to save space
+            if not messages_logger.store_images:
+                for messages in processed_messages:
+                    if "content" in messages and isinstance(messages["content"], list):
+                        for content in messages["content"]:
+                            if isinstance(content, dict) and content.get("type") == "image_url":
+                                content["image_url"]["url"] = "[image]"
+
             processed_messages.append({"role": "assistant", 
-                                    "content": res_dict.get("response", ""), 
-                                    "reasoning": res_dict.get("reasoning", "")})
+                                       "content": res_dict.get("response", ""), 
+                                       "reasoning": res_dict.get("reasoning", "")})
             messages_logger.log_messages(processed_messages)
 
         return res_dict
@@ -430,9 +464,17 @@ class HuggingFaceHubInferenceEngine(InferenceEngine):
             res_dict = self.config.postprocess_response(res)
             # Write to messages log
             if messages_logger:
+                # replace images content with a placeholder "[image]" to save space
+                if not messages_logger.store_images:
+                    for messages in processed_messages:
+                        if "content" in messages and isinstance(messages["content"], list):
+                            for content in messages["content"]:
+                                if isinstance(content, dict) and content.get("type") == "image_url":
+                                    content["image_url"]["url"] = "[image]"
+
                 processed_messages.append({"role": "assistant", 
-                                            "content": res_dict.get("response", ""), 
-                                            "reasoning": res_dict.get("reasoning", "")})
+                                           "content": res_dict.get("response", ""), 
+                                           "reasoning": res_dict.get("reasoning", "")})
                 messages_logger.log_messages(processed_messages)
 
             return res_dict
@@ -521,6 +563,14 @@ class OpenAIInferenceEngine(InferenceEngine):
                 res_dict = self.config.postprocess_response(res_text)
                 # Write to messages log
                 if messages_logger:
+                    # replace images content with a placeholder "[image]" to save space
+                    if not messages_logger.store_images:
+                        for messages in processed_messages:
+                            if "content" in messages and isinstance(messages["content"], list):
+                                for content in messages["content"]:
+                                    if isinstance(content, dict) and content.get("type") == "image_url":
+                                        content["image_url"]["url"] = "[image]"
+
                     processed_messages.append({"role": "assistant",
                                                 "content": res_dict.get("response", ""),
                                                 "reasoning": res_dict.get("reasoning", "")})
@@ -559,6 +609,14 @@ class OpenAIInferenceEngine(InferenceEngine):
         res_dict = self.config.postprocess_response(res)
         # Write to messages log
         if messages_logger:
+            # replace images content with a placeholder "[image]" to save space
+            if not messages_logger.store_images:
+                for messages in processed_messages:
+                    if "content" in messages and isinstance(messages["content"], list):
+                        for content in messages["content"]:
+                            if isinstance(content, dict) and content.get("type") == "image_url":
+                                content["image_url"]["url"] = "[image]"
+
             processed_messages.append({"role": "assistant", 
                                     "content": res_dict.get("response", ""), 
                                     "reasoning": res_dict.get("reasoning", "")})
@@ -593,6 +651,14 @@ class OpenAIInferenceEngine(InferenceEngine):
             res_dict = self.config.postprocess_response(res)
             # Write to messages log
             if messages_logger:
+                # replace images content with a placeholder "[image]" to save space
+                if not messages_logger.store_images:
+                    for messages in processed_messages:
+                        if "content" in messages and isinstance(messages["content"], list):
+                            for content in messages["content"]:
+                                if isinstance(content, dict) and content.get("type") == "image_url":
+                                    content["image_url"]["url"] = "[image]"
+
                 processed_messages.append({"role": "assistant", 
                                         "content": res_dict.get("response", ""), 
                                         "reasoning": res_dict.get("reasoning", "")})
@@ -725,6 +791,14 @@ class LiteLLMInferenceEngine(InferenceEngine):
                 res_dict = self.config.postprocess_response(res_text)
                 # Write to messages log
                 if messages_logger:
+                    # replace images content with a placeholder "[image]" to save space
+                    if not messages_logger.store_images:
+                        for messages in processed_messages:
+                            if "content" in messages and isinstance(messages["content"], list):
+                                for content in messages["content"]:
+                                    if isinstance(content, dict) and content.get("type") == "image_url":
+                                        content["image_url"]["url"] = "[image]"
+
                     processed_messages.append({"role": "assistant",
                                                 "content": res_dict.get("response", ""),
                                                 "reasoning": res_dict.get("reasoning", "")})
@@ -764,6 +838,14 @@ class LiteLLMInferenceEngine(InferenceEngine):
         res_dict = self.config.postprocess_response(res)
         # Write to messages log
         if messages_logger:
+            # replace images content with a placeholder "[image]" to save space
+            if not messages_logger.store_images:
+                for messages in processed_messages:
+                    if "content" in messages and isinstance(messages["content"], list):
+                        for content in messages["content"]:
+                            if isinstance(content, dict) and content.get("type") == "image_url":
+                                content["image_url"]["url"] = "[image]"
+
             processed_messages.append({"role": "assistant", 
                                         "content": res_dict.get("response", ""), 
                                         "reasoning": res_dict.get("reasoning", "")})
@@ -798,6 +880,14 @@ class LiteLLMInferenceEngine(InferenceEngine):
             res_dict = self.config.postprocess_response(res)
             # Write to messages log
             if messages_logger:
+                # replace images content with a placeholder "[image]" to save space
+                if not messages_logger.store_images:
+                    for messages in processed_messages:
+                        if "content" in messages and isinstance(messages["content"], list):
+                            for content in messages["content"]:
+                                if isinstance(content, dict) and content.get("type") == "image_url":
+                                    content["image_url"]["url"] = "[image]"
+
                 processed_messages.append({"role": "assistant", 
                                         "content": res_dict.get("response", ""), 
                                         "reasoning": res_dict.get("reasoning", "")})
@@ -910,6 +1000,14 @@ class OpenAICompatibleInferenceEngine(InferenceEngine):
                 res_dict = self.config.postprocess_response(res_text)
                 # Write to messages log
                 if messages_logger:
+                    # replace images content with a placeholder "[image]" to save space
+                    if not messages_logger.store_images:
+                        for messages in processed_messages:
+                            if "content" in messages and isinstance(messages["content"], list):
+                                for content in messages["content"]:
+                                    if isinstance(content, dict) and content.get("type") == "image_url":
+                                        content["image_url"]["url"] = "[image]"
+
                     processed_messages.append({"role": "assistant",
                                                 "content": res_dict.get("response", ""),
                                                 "reasoning": res_dict.get("reasoning", "")})
@@ -957,6 +1055,14 @@ class OpenAICompatibleInferenceEngine(InferenceEngine):
         res_dict = self.config.postprocess_response(res)
         # Write to messages log
         if messages_logger:
+            # replace images content with a placeholder "[image]" to save space
+            if not messages_logger.store_images:
+                for messages in processed_messages:
+                    if "content" in messages and isinstance(messages["content"], list):
+                        for content in messages["content"]:
+                            if isinstance(content, dict) and content.get("type") == "image_url":
+                                content["image_url"]["url"] = "[image]"
+
             processed_messages.append({"role": "assistant", 
                                     "content": res_dict.get("response", ""), 
                                     "reasoning": res_dict.get("reasoning", "")})
@@ -992,6 +1098,14 @@ class OpenAICompatibleInferenceEngine(InferenceEngine):
             res_dict = self.config.postprocess_response(res)
             # Write to messages log
             if messages_logger:
+                # replace images content with a placeholder "[image]" to save space
+                if not messages_logger.store_images:
+                    for messages in processed_messages:
+                        if "content" in messages and isinstance(messages["content"], list):
+                            for content in messages["content"]:
+                                if isinstance(content, dict) and content.get("type") == "image_url":
+                                    content["image_url"]["url"] = "[image]"
+
                 processed_messages.append({"role": "assistant", 
                                             "content": res_dict.get("response", ""), 
                                             "reasoning": res_dict.get("reasoning", "")})
