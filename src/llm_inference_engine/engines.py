@@ -1142,16 +1142,16 @@ class OpenAICompatibleInferenceEngine(InferenceEngine):
             for chunk in response:
                 if len(chunk.choices) > 0:
                     chunk_dict = self._format_response(chunk)
+                    chunk_text = chunk_dict["data"]
                     
                     if chunk_dict.get("type") == "tool_calls":
-                         # Tool calls are not printed
                         formatted_response["tool_calls"].extend(chunk_dict["data"])
                     else:
-                        chunk_text = chunk_dict["data"]
                         formatted_response[chunk_dict["type"]] += chunk_text
-                        if phase != chunk_dict["type"] and chunk_text != "":
-                            print(f"\n--- {chunk_dict['type'].capitalize()} ---")
-                            phase = chunk_dict["type"]
+
+                    if phase != chunk_dict["type"] and chunk_text != "":
+                        print(f"\n--- {chunk_dict['type'].capitalize()} ---")
+                        phase = chunk_dict["type"]
 
                         print(chunk_text, end="", flush=True)
 
@@ -1446,31 +1446,69 @@ class OpenRouterInferenceEngine(OpenAICompatibleInferenceEngine):
 
     def _format_response(self, response: Any) -> Dict[str, str]:
         """
-        This method format the response from OpenAI API to a dict with keys "type" and "data".
+        This method format the response (ChatCompletion or ChatCompletionChunk) from OpenAI API to a dict:
+        If streaming (ChatCompletionChunk), returns a dict with keys "type" and "data".
+        If non-streaming (ChatCompletion), returns a dict with keys "response", "reasoning", and "tool_calls".
 
         Parameters:
         ----------
         response : Any
-            the response from OpenAI-compatible API. Could be a dict, generator, or object.
+            the response from OpenAI-compatible API. Could be a ChatCompletion or ChatCompletionChunk.
+
+        Returns:
+        -------
+        formatted_response : Dict[str, str]
+            If streaming, a dict {"type": <reasoning, response, or tool_calls>, "data": <content>}.
+            If non-streaming, a dict {"response": <response>, "reasoning": <reasoning>, "tool_calls": <tool_calls>}.
+            Tool calls are returned as List[{"name": <function_name>, "arguments": <function_arguments>}].
         """
+        # Streaming response
         if isinstance(response, self.ChatCompletionChunk):
             delta = response.choices[0].delta
             
-            # Check for tool calls in streaming
-            if delta.tool_calls is not None:
-                return {"type": "tool_calls", "data": delta.tool_calls}
+            # Tool call chunks
+            if hasattr(delta, "tool_calls") and getattr(delta, "tool_calls") is not None:
+                if isinstance(delta.tool_calls, list):
+                    tool_calls = []
+                    for tool_call in delta.tool_calls:
+                        function = tool_call.function
+                        function_name = function.name
+                        function_arguments = function.arguments
+                        tool_calls.append({"name": function_name, "arguments": function_arguments})
+              
+                    return {"type": "tool_calls", "data": tool_calls}
             
-            if hasattr(delta, "reasoning") and getattr(delta, "reasoning") is not None:
-                chunk_text = getattr(delta, "reasoning", "")
+            # Reasoning content chunks
+            elif hasattr(delta, "reasoning_content") and getattr(delta, "reasoning_content") is not None:
+                chunk_text = getattr(delta, "reasoning_content", "")
                 if chunk_text is None:
                     chunk_text = ""
                 return {"type": "reasoning", "data": chunk_text}
+            
+            # Response content chunks
             else:
                 chunk_text = getattr(delta, "content", "")
                 if chunk_text is None:
                     chunk_text = ""
                 return {"type": "response", "data": chunk_text}
 
-        return {"reasoning": getattr(response.choices[0].message, "reasoning", ""),
-                "response": getattr(response.choices[0].message, "content", ""),
-                "tool_calls": getattr(response.choices[0].message, "tool_calls", None)}
+        # Non-streaming response
+        elif isinstance(response, self.ChatCompletion):
+            message = response.choices[0].message
+            # Response extraction
+            response = message.content if hasattr(message, "content") else ""
+            response = response if response is not None else ""
+            # Reasoning extraction
+            reasoning = message.reasoning if hasattr(message, "reasoning") else ""
+            reasoning = reasoning if reasoning is not None else ""
+            # Tool calls extraction
+            tool_calls = []
+            if message.tool_calls:
+                for tool_call in message.tool_calls:
+                    function = tool_call.function
+                    function_name = function.name
+                    function_arguments = function.arguments
+                    tool_calls.append({"name": function_name, "arguments": function_arguments})
+            return {"response": response,
+                    "reasoning": reasoning,
+                    "tool_calls": tool_calls}
