@@ -1,7 +1,7 @@
 import abc
 import re
 import warnings
-from typing import List, Dict, Union, Generator
+from typing import List, Dict, Union, Generator, Any
 
 
 class LLMConfig(abc.ABC):
@@ -32,18 +32,18 @@ class LLMConfig(abc.ABC):
         return NotImplemented
 
     @abc.abstractmethod
-    def postprocess_response(self, response:Union[str, Dict[str, str], Generator[str, None, None]]) -> Union[Dict[str,str], Generator[Dict[str, str], None, None]]:
+    def postprocess_response(self, response:Union[str, Dict[str, Any], Generator[str, None, None]]) -> Union[Dict[str, Any], Generator[Dict[str, Any], None, None]]:
         """
         This method postprocesses the LLM response after it is generated.
 
         Parameters:
         ----------
-        response : Union[str, Dict[str, str], Generator[Dict[str, str], None, None]]
+        response : Union[str, Dict[str, Any], Generator[Dict[str, Any], None, None]]
             the LLM response. Can be a dict or a generator. 
         
         Returns:
         -------
-        response : Union[Dict[str,str], Generator[Dict[str, str], None, None]]
+        response : Union[Dict[str, Any], Generator[Dict[str, Any], None, None]]
             the postprocessed LLM response
         """
         return NotImplemented
@@ -76,16 +76,16 @@ class BasicLLMConfig(LLMConfig):
         """
         return messages.copy()
 
-    def postprocess_response(self, response:Union[str, Dict[str, str], Generator[str, None, None]]) -> Union[Dict[str,str], Generator[Dict[str, str], None, None]]:
+    def postprocess_response(self, response:Union[str, Dict[str, Any], Generator[str, None, None]]) -> Union[Dict[str, Any], Generator[Dict[str, Any], None, None]]:
         """
         This method postprocesses the LLM response after it is generated.
 
         Parameters:
         ----------
-        response : Union[str, Dict[str, str], Generator[str, None, None]]
+        response : Union[str, Dict[str, Any], Generator[str, None, None]]
             the LLM response. Can be a string or a generator.
         
-        Returns: Union[Dict[str,str], Generator[Dict[str, str], None, None]]
+        Returns: Union[Dict[str,Any], Generator[Dict[str, Any], None, None]]
             the postprocessed LLM response. 
             If input is a string, the output will be a dict {"response": <response>}. 
             if input is a generator, the output will be a generator {"type": "response", "data": <content>}.
@@ -94,7 +94,7 @@ class BasicLLMConfig(LLMConfig):
             return {"response": response}
         
         elif isinstance(response, dict):
-            if "response" in response:
+            if "response" in response or "tool_calls" in response:
                 return response
             else:
                 warnings.warn(f"Invalid response dict keys: {response.keys()}. Returning default empty dict.", UserWarning)
@@ -143,9 +143,9 @@ class ReasoningLLMConfig(LLMConfig):
         """
         This method postprocesses the LLM response after it is generated.
         1. If input is a string, it will extract the reasoning and response based on the thinking tokens.
-        2. If input is a dict, it should contain keys "reasoning" and "response". This is for inference engines that already parse reasoning and response.
+        2. If input is a dict, it should contain keys "reasoning", "response", or "tool_calls". This is for inference engines that already parse reasoning, response, and tool calls.
         3. If input is a generator, 
-            a. if the chunk is a dict, it should contain keys "type" and "data". This is for inference engines that already parse reasoning and response.
+            a. if the chunk is a dict, it should contain keys "type" and "data". This is for inference engines that already parse reasoning, response, and tool calls.
             b. if the chunk is a string, it will yield dicts with keys "type" and "data" based on the thinking tokens.
 
         Parameters:
