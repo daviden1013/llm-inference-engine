@@ -4,7 +4,7 @@ from llm_inference_engine import OpenRouterInferenceEngine, BasicLLMConfig, Open
 
 # --- CONFIGURATION ---
 MODEL_BASIC = "meta-llama/llama-4-scout"
-MODEL_REASONING = "openai/gpt-oss-20b:free"
+MODEL_REASONING = "openai/gpt-oss-20b"
 
 @pytest.mark.skipif(not os.getenv("OPENROUTER_API_KEY"), reason="OPENROUTER_API_KEY not set")
 class TestOpenRouterEngine:
