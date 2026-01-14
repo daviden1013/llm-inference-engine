@@ -503,10 +503,13 @@ class OpenAIInferenceEngine(InferenceEngine):
             raise ImportError("OpenAI Python API library not found. Please install OpanAI (```pip install openai```).")
         
         from openai import OpenAI, AsyncOpenAI
+        from openai.types.chat import ChatCompletionChunk, ChatCompletion
         super().__init__(config=config, max_concurrent_requests=max_concurrent_requests, max_requests_per_minute=max_requests_per_minute)
         self.client = OpenAI(**kwrs)
         self.async_client = AsyncOpenAI(**kwrs)
         self.model = model
+        self.ChatCompletion = ChatCompletion
+        self.ChatCompletionChunk = ChatCompletionChunk
 
     def _format_config(self) -> Dict[str, Any]:
         """
@@ -519,7 +522,148 @@ class OpenAIInferenceEngine(InferenceEngine):
 
         return formatted_params
 
-    def chat(self, messages:List[Dict[str,str]], verbose:bool=False, stream:bool=False, messages_logger:MessagesLogger=None, **kwargs) -> Union[Dict[str, str], Generator[Dict[str, str], None, None]]:
+    def _format_response(self, response: Any) -> Dict[str, str]:
+        """
+        Format OpenAI API response (ChatCompletion or ChatCompletionChunk) to a standardized dict.
+        
+        For streaming (ChatCompletionChunk), returns:
+            {"type": "response" | "tool_call_delta", "data": <content>}
+        For non-streaming (ChatCompletion), returns:
+            {"response": str, "reasoning": str, "tool_calls": list}
+        """
+        # Streaming response
+        if isinstance(response, self.ChatCompletionChunk):
+            delta = response.choices[0].delta
+            
+            # Tool call chunks - OpenAI streams incrementally
+            if hasattr(delta, "tool_calls") and delta.tool_calls is not None:
+                if isinstance(delta.tool_calls, list) and len(delta.tool_calls) > 0:
+                    tool_call_deltas = []
+                    for tc in delta.tool_calls:
+                        tool_call_deltas.append({
+                            "index": tc.index,
+                            "id": tc.id,
+                            "name": tc.function.name if tc.function else None,
+                            "arguments": tc.function.arguments if tc.function else ""
+                        })
+                    return {"type": "tool_call_delta", "data": tool_call_deltas}
+            
+            # Response content chunks (OpenAI doesn't have reasoning_content)
+            chunk_text = getattr(delta, "content", "") or ""
+            return {"type": "response", "data": chunk_text}
+
+        # Non-streaming response
+        message = response.choices[0].message
+        
+        # Response extraction
+        response_text = message.content if hasattr(message, "content") else ""
+        response_text = response_text if response_text is not None else ""
+        
+        # Reasoning extraction (OpenAI o1 models may have this)
+        reasoning = ""
+        if hasattr(message, "reasoning"):
+            reasoning = message.reasoning if message.reasoning is not None else ""
+        
+        # Tool calls extraction
+        tool_calls = []
+        if hasattr(message, "tool_calls") and message.tool_calls is not None:
+            for tc in message.tool_calls:
+                tool_calls.append({
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments
+                })
+        
+        return {
+            "response": response_text,
+            "reasoning": reasoning,
+            "tool_calls": tool_calls
+        }
+
+    def _log_messages(self, processed_messages: List[Dict[str, str]], res_dict: Dict[str, str], messages_logger: MessagesLogger):
+        """Helper method to log messages."""
+        if not messages_logger.store_images:
+            for msg in processed_messages:
+                if "content" in msg and isinstance(msg["content"], list):
+                    for content in msg["content"]:
+                        if isinstance(content, dict) and content.get("type") == "image_url":
+                            content["image_url"]["url"] = "[image]"
+
+        processed_messages.append({
+            "role": "assistant",
+            "content": res_dict.get("response", ""),
+            "reasoning": res_dict.get("reasoning", ""),
+            "tool_calls": res_dict.get("tool_calls", None)
+        })
+        messages_logger.log_messages(processed_messages)
+
+    def _chat_stream(self, processed_messages: List[Dict[str, str]], **kwargs) -> Generator[Dict[str, Any], None, Dict[str, Any]]:
+        """
+        Helper method for streaming chat responses.
+        Handles OpenAI's incremental tool call streaming.
+        
+        Yields:
+            {"type": "response" | "tool_calls", "data": <content>}
+        
+        Returns:
+            Aggregated response dict with keys: response, reasoning, tool_calls
+        """
+        response_stream = self.client.chat.completions.create(
+            model=self.model,
+            messages=processed_messages,
+            stream=True,
+            **self.formatted_params,
+            **kwargs
+        )
+        
+        agg_response = {"reasoning": "", "response": "", "tool_calls": []}
+        tool_call_accumulators = {}  # index -> {"id": str, "name": str, "arguments": str}
+        
+        for chunk in response_stream:
+            if len(chunk.choices) > 0:
+                chunk_dict = self._format_response(chunk)
+                
+                # Handle incremental tool call deltas - accumulate without yielding
+                if chunk_dict.get("type") == "tool_call_delta":
+                    for tc_delta in chunk_dict["data"]:
+                        idx = tc_delta["index"]
+                        if idx not in tool_call_accumulators:
+                            tool_call_accumulators[idx] = {"id": "", "name": "", "arguments": ""}
+                        
+                        # Accumulate non-None values
+                        if tc_delta["id"] is not None:
+                            tool_call_accumulators[idx]["id"] = tc_delta["id"]
+                        if tc_delta["name"] is not None:
+                            tool_call_accumulators[idx]["name"] = tc_delta["name"]
+                        if tc_delta["arguments"]:
+                            tool_call_accumulators[idx]["arguments"] += tc_delta["arguments"]
+                    
+                    # Don't yield incremental tool call deltas
+                    continue
+                
+                # Yield non-tool-call chunks normally
+                yield chunk_dict
+                
+                # Aggregate response
+                if chunk_dict.get("type") == "response":
+                    agg_response["response"] += chunk_dict["data"]
+                
+                if chunk.choices[0].finish_reason == "length":
+                    warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
+        
+        # After streaming completes, convert accumulated tool calls to final format
+        if tool_call_accumulators:
+            sorted_tool_calls = sorted(tool_call_accumulators.items(), key=lambda x: x[0])
+            agg_response["tool_calls"] = [
+                {"name": tc["name"], "arguments": tc["arguments"]}
+                for idx, tc in sorted_tool_calls
+            ]
+            # Yield the complete tool calls at the end
+            yield {"type": "tool_calls", "data": agg_response["tool_calls"]}
+        
+        return agg_response
+
+    def chat(self, messages: List[Dict[str, str]], verbose: bool = False, stream: bool = False, 
+             messages_logger: MessagesLogger = None, **kwargs) -> Union[Dict[str, str], Generator[Dict[str, str], None, None]]:
         """
         This method inputs chat messages and outputs LLM generated text.
 
@@ -528,7 +672,7 @@ class OpenAIInferenceEngine(InferenceEngine):
         messages : List[Dict[str,str]]
             a list of dict with role and content. role must be one of {"system", "user", "assistant"}
         verbose : bool, Optional
-            if True, VLM generated text will be printed in terminal in real-time.
+            if True, LLM generated text will be printed in terminal in real-time.
         stream : bool, Optional
             if True, returns a generator that yields the output in real-time.
         messages_logger : MessagesLogger, Optional
@@ -537,126 +681,61 @@ class OpenAIInferenceEngine(InferenceEngine):
         Returns:
         -------
         response : Union[Dict[str,str], Generator[Dict[str, str], None, None]]
-            a dict {"reasoning": <reasoning>, "response": <response>} or Generator {"type": <reasoning or response>, "data": <content>}
+            a dict {"reasoning": <reasoning>, "response": <response>, "tool_calls": <tool_calls>} 
+            or Generator {"type": <response or tool_calls>, "data": <content>}
         """
         processed_messages = self.config.preprocess_messages(messages)
 
         if stream:
             def _stream_generator():
-                response_stream = self.client.chat.completions.create(
-                                        model=self.model,
-                                        messages=processed_messages,
-                                        stream=True,
-                                        **self.formatted_params,
-                                        **kwargs
-                                    )
-                formatted_response = {"response": "", "tool_calls": []}
-                for chunk in response_stream:
-                    if len(chunk.choices) > 0:
-                        delta = chunk.choices[0].delta
-            
-                        # Tool call chunks
-                        if hasattr(delta, "tool_calls") and getattr(delta, "tool_calls") is not None:
-                            if isinstance(delta.tool_calls, list) and len(delta.tool_calls) > 0:
-                                tool_call = delta.tool_calls[0]
-                                function = tool_call.function
-                                function_name = function.name
-                                function_arguments = function.arguments
-                                chunk_dict = {"type": "tool_calls", "data": {"name": function_name, "arguments": function_arguments}}
-                        
-                        # Response content chunks
-                        else:
-                            chunk_text = getattr(delta, "content", "")
-                            if chunk_text is None:
-                                chunk_text = ""
-                            chunk_dict = {"type": "response", "data": chunk_text}
-                        
+                stream_gen = self._chat_stream(processed_messages, **kwargs)
+                agg_response = None
+                
+                try:
+                    while True:
+                        chunk_dict = next(stream_gen)
                         yield chunk_dict
-
-                        if chunk_dict.get("type") == "response":
-                            formatted_response["response"] += chunk_dict["data"]
-                        if chunk_dict.get("type") == "tool_calls":
-                            # if first chunk of a tool call
-                            if chunk_dict['data']['name']:
-                                formatted_response["tool_calls"].append({"name": chunk_dict['data']['name'], "arguments": chunk_dict['data']['arguments']})
-                            else:
-                                formatted_response["tool_calls"][-1]["arguments"] += chunk_dict['data']['arguments']
-
-                        if chunk.choices[0].finish_reason == "length":
-                            warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
-
-                # Postprocess response
-                res_dict = self.config.postprocess_response(formatted_response)
-                # Write to messages log
+                except StopIteration as e:
+                    agg_response = e.value
+                
+                # Postprocess and log
+                agg_response = agg_response if agg_response is not None else {"reasoning": "", "response": "", "tool_calls": []}
+                res_dict = self.config.postprocess_response(agg_response)
                 if messages_logger:
-                    # replace images content with a placeholder "[image]" to save space
-                    if not messages_logger.store_images:
-                        for messages in processed_messages:
-                            if "content" in messages and isinstance(messages["content"], list):
-                                for content in messages["content"]:
-                                    if isinstance(content, dict) and content.get("type") == "image_url":
-                                        content["image_url"]["url"] = "[image]"
-
-                    processed_messages.append({"role": "assistant",
-                                                "content": res_dict.get("response", ""),
-                                                "tool_calls": res_dict.get("tool_calls", None)})
-                    messages_logger.log_messages(processed_messages)
+                    self._log_messages(processed_messages, res_dict, messages_logger)
 
             return self.config.postprocess_response(_stream_generator())
 
         elif verbose:
-            response_stream = self.client.chat.completions.create(
-                model=self.model,
-                messages=processed_messages,
-                stream=True,
-                **self.formatted_params,
-                **kwargs
-            )
-            formatted_response = {"response": "", "tool_calls": []}
-            for chunk in response_stream:
-                if len(chunk.choices) > 0:
-                    delta = chunk.choices[0].delta
+            phase = ""
+            agg_response = None
             
-                    # Tool call chunks
-                    if hasattr(delta, "tool_calls") and getattr(delta, "tool_calls") is not None:
-                        if isinstance(delta.tool_calls, list) and len(delta.tool_calls) > 0:
-                            tool_call = delta.tool_calls[0]
-                            function = tool_call.function
-                            function_name = function.name
-                            function_arguments = function.arguments
-                            chunk_dict = {"type": "tool_calls", "data": {"name": function_name, "arguments": function_arguments}}
+            stream_gen = self._chat_stream(processed_messages, **kwargs)
+            
+            try:
+                while True:
+                    chunk_dict = next(stream_gen)
+                    chunk_type = chunk_dict["type"]
+                    chunk_data = chunk_dict["data"]
                     
-                    # Response content chunks
+                    # Print with phase headers
+                    if chunk_type == "tool_calls":
+                        # Tool calls come as complete list at the end
+                        for tool_call in chunk_data:
+                            print(f"\n--- Tool Call: {tool_call['name']} ---")
+                            print(f"Arguments: {tool_call['arguments']}")
                     else:
-                        chunk_text = getattr(delta, "content", "")
-                        if chunk_text is None:
-                            chunk_text = ""
-                        chunk_dict = {"type": "response", "data": chunk_text}
+                        if phase != chunk_type and chunk_data != "":
+                            print(f"\n--- {chunk_type.capitalize()} ---")
+                            phase = chunk_type
+                        print(chunk_data, end="", flush=True)
                         
-                    # Verbose printing
-                    phase = ""
-                    if chunk_dict.get("type") == "tool_calls":
-                        # if first chunk of a tool call
-                        if chunk_dict['data']['name']:
-                            print(f"\n--- Tool Call: {chunk_dict['data']['name']} ---")
-                            formatted_response["tool_calls"].append({"name": chunk_dict['data']['name'], "arguments": chunk_dict['data']['arguments']})
-                        else:
-                            formatted_response["tool_calls"][-1]["arguments"] += chunk_dict['data']['arguments']
-                        print(chunk_dict['data']['arguments'], end="", flush=True)
-
-                    else:
-                        chunk_text = chunk_dict["data"]
-                        formatted_response[chunk_dict["type"]] += chunk_text
-                        if phase != chunk_dict["type"] and chunk_text != "":
-                            print(f"\n--- {chunk_dict['type'].capitalize()} ---")
-                            phase = chunk_dict["type"]
-
-                        print(chunk_text, end="", flush=True)
-
-                    if chunk.choices[0].finish_reason == "length":
-                        warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
-
+            except StopIteration as e:
+                agg_response = e.value
+            
             print('\n')
+            agg_response = agg_response if agg_response is not None else {"reasoning": "", "response": "", "tool_calls": []}
+            formatted_response = agg_response
 
         else:
             chat_completion = self.client.chat.completions.create(
@@ -670,47 +749,18 @@ class OpenAIInferenceEngine(InferenceEngine):
             if chat_completion.choices[0].finish_reason == "length":
                 warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
 
-            # Apply OpenAI-compatible engine-specific response formatting
-            message = chat_completion.choices[0].message
-            # Response extraction
-            response = message.content if hasattr(message, "content") else ""
-            response = response if response is not None else ""
-            # Reasoning extraction
-            reasoning = message.reasoning if hasattr(message, "reasoning") else ""
-            reasoning = reasoning if reasoning is not None else ""
-            # Tool calls extraction
-            tool_calls = []
-            if message.tool_calls:
-                for tool_call in message.tool_calls:
-                    function = tool_call.function
-                    function_name = function.name
-                    function_arguments = function.arguments
-                    tool_calls.append({"name": function_name, "arguments": function_arguments})
-
-            formatted_response = {"response": response, "reasoning": reasoning, "tool_calls": tool_calls}
+            formatted_response = self._format_response(chat_completion)
             
         # Postprocess response by config
         res_dict = self.config.postprocess_response(formatted_response)
+        
         # Write to messages log
         if messages_logger:
-            # replace images content with a placeholder "[image]" to save space
-            if not messages_logger.store_images:
-                for messages in processed_messages:
-                    if "content" in messages and isinstance(messages["content"], list):
-                        for content in messages["content"]:
-                            if isinstance(content, dict) and content.get("type") == "image_url":
-                                content["image_url"]["url"] = "[image]"
-
-            processed_messages.append({"role": "assistant", 
-                                    "content": res_dict.get("response", ""), 
-                                    "reasoning": res_dict.get("reasoning", ""),
-                                    "tool_calls": res_dict.get("tool_calls", None)})
-            messages_logger.log_messages(processed_messages)
+            self._log_messages(processed_messages, res_dict, messages_logger)
 
         return res_dict
-    
 
-    async def chat_async(self, messages:List[Dict[str,str]], messages_logger:MessagesLogger=None, **kwargs) -> Dict[str,str]:
+    async def chat_async(self, messages: List[Dict[str, str]], messages_logger: MessagesLogger = None, **kwargs) -> Dict[str, str]:
         """
         Async version of chat method. Streaming is not supported.
         """
@@ -732,42 +782,14 @@ class OpenAIInferenceEngine(InferenceEngine):
             if chat_completion.choices[0].finish_reason == "length":
                 warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
 
-            # Apply OpenAI-compatible engine-specific response formatting
-            message = chat_completion.choices[0].message
-            # Response extraction
-            response = message.content if hasattr(message, "content") else ""
-            response = response if response is not None else ""
-            # Reasoning extraction
-            reasoning = message.reasoning if hasattr(message, "reasoning") else ""
-            reasoning = reasoning if reasoning is not None else ""
-            # Tool calls extraction
-            tool_calls = []
-            if message.tool_calls:
-                for tool_call in message.tool_calls:
-                    function = tool_call.function
-                    function_name = function.name
-                    function_arguments = function.arguments
-                    tool_calls.append({"name": function_name, "arguments": function_arguments})
-
-            formatted_response = {"response": response, "reasoning": reasoning, "tool_calls": tool_calls}
+            formatted_response = self._format_response(chat_completion)
 
             # Postprocess response by config
             res_dict = self.config.postprocess_response(formatted_response)
+            
             # Write to messages log
             if messages_logger:
-                # replace images content with a placeholder "[image]" to save space
-                if not messages_logger.store_images:
-                    for messages in processed_messages:
-                        if "content" in messages and isinstance(messages["content"], list):
-                            for content in messages["content"]:
-                                if isinstance(content, dict) and content.get("type") == "image_url":
-                                    content["image_url"]["url"] = "[image]"
-
-                processed_messages.append({"role": "assistant", 
-                                            "content": res_dict.get("response", ""), 
-                                            "reasoning": res_dict.get("reasoning", ""),
-                                            "tool_calls": res_dict.get("tool_calls", None)})
-                messages_logger.log_messages(processed_messages)
+                self._log_messages(processed_messages, res_dict, messages_logger)
 
             return res_dict
         finally:
@@ -1014,7 +1036,7 @@ class OpenAICompatibleInferenceEngine(InferenceEngine):
 
         Parameters:
         ----------
-        model_name : str
+        model : str
             model name as shown in the vLLM server
         api_key : str
             the API key for the vLLM server.
@@ -1053,14 +1075,61 @@ class OpenAICompatibleInferenceEngine(InferenceEngine):
     @abc.abstractmethod
     def _format_response(self, response: Any) -> Dict[str, str]:
         """
-        This method format the response from OpenAI API to a dict with keys "type" and "data".
-
-        Parameters:
-        ----------
-        response : Any
-            the response from OpenAI-compatible API. Could be a dict, generator, or object.
+        This method format the response (ChatCompletion or ChatCompletionChunk) from OpenAI API to a dict.
+        Must be implemented by child classes to handle backend-specific response formats.
         """
         return NotImplemented
+    
+    
+    def _log_messages(self, processed_messages:List[Dict[str,str]], res_dict:Dict[str,str], messages_logger:MessagesLogger):
+        """Helper method to log messages."""
+        if not messages_logger.store_images:
+            for msg in processed_messages:
+                if "content" in msg and isinstance(msg["content"], list):
+                    for content in msg["content"]:
+                        if isinstance(content, dict) and content.get("type") == "image_url":
+                            content["image_url"]["url"] = "[image]"
+
+        processed_messages.append({
+            "role": "assistant", 
+            "content": res_dict.get("response", ""), 
+            "reasoning": res_dict.get("reasoning", ""),
+            "tool_calls": res_dict.get("tool_calls", None)
+        })
+        messages_logger.log_messages(processed_messages)
+
+    def _chat_stream(self, processed_messages:List[Dict[str,str]], **kwargs) -> Generator[Dict[str, Any], None, Dict[str, Any]]:
+        """
+        Helper method for streaming chat responses. Can be overridden by child classes
+        to handle backend-specific streaming behavior.
+        """
+        response_stream = self.client.chat.completions.create(
+            model=self.model,
+            messages=processed_messages,
+            stream=True,
+            **self.formatted_params,
+            **kwargs
+        )
+        
+        agg_response = {"reasoning": "", "response": "", "tool_calls": []}
+        
+        for chunk in response_stream:
+            if len(chunk.choices) > 0:
+                chunk_dict = self._format_response(chunk)
+                yield chunk_dict
+                
+                # Aggregate the response
+                if chunk_dict.get("type") == "reasoning":
+                    agg_response["reasoning"] += chunk_dict["data"]
+                elif chunk_dict.get("type") == "response":
+                    agg_response["response"] += chunk_dict["data"]
+                elif chunk_dict.get("type") == "tool_calls":
+                    agg_response["tool_calls"].extend(chunk_dict["data"])
+                
+                if chunk.choices[0].finish_reason == "length":
+                    warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
+        
+        return agg_response
 
     def chat(self, messages:List[Dict[str,str]], verbose:bool=False, stream:bool=False, messages_logger:MessagesLogger=None, **kwargs) -> Union[Dict[str, str], Generator[Dict[str, str], None, None]]:
         """
@@ -1086,79 +1155,52 @@ class OpenAICompatibleInferenceEngine(InferenceEngine):
 
         if stream:
             def _stream_generator():
-                response_stream = self.client.chat.completions.create(
-                                        model=self.model,
-                                        messages=processed_messages,
-                                        stream=True,
-                                        **self.formatted_params,
-                                        **kwargs
-                                    )
-                formatted_response = {"reasoning": "", "response": "", "tool_calls": []}
-                for chunk in response_stream:
-                    if len(chunk.choices) > 0:
-                        chunk_dict = self._format_response(chunk)
+                stream_gen = self._chat_stream(processed_messages, **kwargs)
+                agg_response = None
+                
+                try:
+                    while True:
+                        chunk_dict = next(stream_gen)
                         yield chunk_dict
-
-                        if chunk_dict.get("type") == "reasoning":
-                            formatted_response["reasoning"] += chunk_dict["data"]
-                        elif chunk_dict.get("type") == "response":
-                            formatted_response["response"] += chunk_dict["data"]
-                        elif chunk_dict.get("type") == "tool_calls":
-                            formatted_response["tool_calls"].extend(chunk_dict["data"])
-
-                        if chunk.choices[0].finish_reason == "length":
-                            warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
-
-                # Postprocess response
-                res_dict = self.config.postprocess_response(formatted_response)
-                # Write to messages log
+                except StopIteration as e:
+                    agg_response = e.value 
+                
+                # Postprocess and log
+                agg_response = agg_response if agg_response is not None else {"reasoning": "", "response": "", "tool_calls": []}
+                res_dict = self.config.postprocess_response(agg_response)
                 if messages_logger:
-                    # replace images content with a placeholder "[image]" to save space
-                    if not messages_logger.store_images:
-                        for messages in processed_messages:
-                            if "content" in messages and isinstance(messages["content"], list):
-                                for content in messages["content"]:
-                                    if isinstance(content, dict) and content.get("type") == "image_url":
-                                        content["image_url"]["url"] = "[image]"
-
-                    processed_messages.append({"role": "assistant",
-                                                "content": res_dict.get("response", ""),
-                                                "reasoning": res_dict.get("reasoning", ""),
-                                                "tool_calls": res_dict.get("tool_calls", None)})
-                    messages_logger.log_messages(processed_messages)
+                    self._log_messages(processed_messages, res_dict, messages_logger)
 
             return self.config.postprocess_response(_stream_generator())
 
         elif verbose:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=processed_messages,
-                stream=True,
-                **self.formatted_params,
-                **kwargs
-            )
-            formatted_response = {"reasoning": "", "response": "", "tool_calls": []}
             phase = ""
-            for chunk in response:
-                if len(chunk.choices) > 0:
-                    chunk_dict = self._format_response(chunk)
-                    chunk_text = chunk_dict["data"]
+            agg_response = None
+            
+            stream_gen = self._chat_stream(processed_messages, **kwargs)
+            
+            try:
+                while True:
+                    chunk_dict = next(stream_gen)
+                    chunk_type = chunk_dict["type"]
+                    chunk_data = chunk_dict["data"]
                     
-                    if chunk_dict.get("type") == "tool_calls":
-                        formatted_response["tool_calls"].extend(chunk_dict["data"])
+                    # Print with phase headers
+                    if phase != chunk_type and chunk_data != "":
+                        print(f"\n--- {chunk_type.capitalize()} ---")
+                        phase = chunk_type
+                    
+                    if chunk_type == "tool_calls":
+                        for tool_call in chunk_data:
+                            print(f"Tool: {tool_call['name']}, Args: {tool_call['arguments']}")
                     else:
-                        formatted_response[chunk_dict["type"]] += chunk_text
-
-                    if phase != chunk_dict["type"] and chunk_text != "":
-                        print(f"\n--- {chunk_dict['type'].capitalize()} ---")
-                        phase = chunk_dict["type"]
-
-                        print(chunk_text, end="", flush=True)
-
-                    if chunk.choices[0].finish_reason == "length":
-                        warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
-
+                        print(chunk_data, end="", flush=True)
+            except StopIteration as e:
+                agg_response = e.value  # Capture the return value here!
+            
             print('\n')
+            agg_response = agg_response if agg_response is not None else {"reasoning": "", "response": "", "tool_calls": []}
+            formatted_response = agg_response
 
         else:
             chat_completion = self.client.chat.completions.create(
@@ -1172,26 +1214,14 @@ class OpenAICompatibleInferenceEngine(InferenceEngine):
             if chat_completion.choices[0].finish_reason == "length":
                 warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
 
-            # Apply OpenAI-compatible engine-specific response formatting
             formatted_response = self._format_response(chat_completion)
             
         # Postprocess response by config
         res_dict = self.config.postprocess_response(formatted_response)
+        
         # Write to messages log
         if messages_logger:
-            # replace images content with a placeholder "[image]" to save space
-            if not messages_logger.store_images:
-                for messages in processed_messages:
-                    if "content" in messages and isinstance(messages["content"], list):
-                        for content in messages["content"]:
-                            if isinstance(content, dict) and content.get("type") == "image_url":
-                                content["image_url"]["url"] = "[image]"
-
-            processed_messages.append({"role": "assistant", 
-                                    "content": res_dict.get("response", ""), 
-                                    "reasoning": res_dict.get("reasoning", ""),
-                                    "tool_calls": res_dict.get("tool_calls", None)})
-            messages_logger.log_messages(processed_messages)
+            self._log_messages(processed_messages, res_dict, messages_logger)
 
         return res_dict
     
@@ -1218,32 +1248,16 @@ class OpenAICompatibleInferenceEngine(InferenceEngine):
             if chat_completion.choices[0].finish_reason == "length":
                 warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
 
-            # Apply OpenAI-compatible engine-specific response formatting
             formatted_response = self._format_response(chat_completion)
-
-            # Postprocess response by config
             res_dict = self.config.postprocess_response(formatted_response)
-            # Write to messages log
+            
             if messages_logger:
-                # replace images content with a placeholder "[image]" to save space
-                if not messages_logger.store_images:
-                    for messages in processed_messages:
-                        if "content" in messages and isinstance(messages["content"], list):
-                            for content in messages["content"]:
-                                if isinstance(content, dict) and content.get("type") == "image_url":
-                                    content["image_url"]["url"] = "[image]"
-
-                processed_messages.append({"role": "assistant", 
-                                            "content": res_dict.get("response", ""), 
-                                            "reasoning": res_dict.get("reasoning", ""),
-                                            "tool_calls": res_dict.get("tool_calls", None)})
-                messages_logger.log_messages(processed_messages)
+                self._log_messages(processed_messages, res_dict, messages_logger)
 
             return res_dict
         finally:
             if self.concurrency_limiter:
                 self.concurrency_limiter.release()
-
 
 class VLLMInferenceEngine(OpenAICompatibleInferenceEngine):
     def __init__(self, model:str, api_key:str="", base_url:str="http://localhost:8000/v1", config:LLMConfig=None, 
@@ -1269,47 +1283,114 @@ class VLLMInferenceEngine(OpenAICompatibleInferenceEngine):
         max_requests_per_minute : int, Optional
             the maximum number of requests per minute.
         """
-        super().__init__(model=model, 
-                         api_key=api_key, 
-                         base_url=base_url, 
-                         config=config, 
+        super().__init__(model=model, api_key=api_key, base_url=base_url, config=config, 
                          max_concurrent_requests=max_concurrent_requests, 
-                         max_requests_per_minute=max_requests_per_minute, 
-                         **kwrs)
-
+                         max_requests_per_minute=max_requests_per_minute, **kwrs)
 
     def _format_response(self, response: Any) -> Dict[str, str]:
-        """
-        This method format the response from OpenAI API to a dict with keys "type" and "data".
-
-        Parameters:
-        ----------
-        response : Any
-            the response from OpenAI-compatible API. Could be a dict, generator, or object.
-        """
+        """Format vLLM-specific responses."""
         if isinstance(response, self.ChatCompletionChunk):
             delta = response.choices[0].delta
             
-            # Check for tool calls in streaming
+            # Tool calls - vLLM streams incrementally, return delta for accumulation
             if delta.tool_calls is not None:
-                return {"type": "tool_calls", "data": delta.tool_calls}
+                tool_call_deltas = []
+                for tc in delta.tool_calls:
+                    tool_call_deltas.append({
+                        "index": tc.index,
+                        "id": tc.id,
+                        "name": tc.function.name if tc.function else None,
+                        "arguments": tc.function.arguments if tc.function else ""
+                    })
+                return {"type": "tool_call_delta", "data": tool_call_deltas}
             
-            # Check for reasoning content
+            # Reasoning content
             if hasattr(delta, "reasoning_content") and getattr(delta, "reasoning_content") is not None:
-                chunk_text = getattr(delta, "reasoning_content", "")
-                if chunk_text is None:
-                    chunk_text = ""
+                chunk_text = getattr(delta, "reasoning_content", "") or ""
                 return {"type": "reasoning", "data": chunk_text}
-            else:
-                chunk_text = getattr(delta, "content", "")
-                if chunk_text is None:
-                    chunk_text = ""
-                return {"type": "response", "data": chunk_text}
+            
+            # Response content
+            chunk_text = getattr(delta, "content", "") or ""
+            return {"type": "response", "data": chunk_text}
 
-        return {"reasoning": getattr(response.choices[0].message, "reasoning_content", ""),
-                "response": getattr(response.choices[0].message, "content", ""),
-                "tool_calls": getattr(response.choices[0].message, "tool_calls", None)}
+        # Non-streaming
+        message = response.choices[0].message
+        tool_calls = None
+        if hasattr(message, "tool_calls") and message.tool_calls is not None:
+            tool_calls = []
+            for tc in message.tool_calls:
+                tool_calls.append({"name": tc.function.name, "arguments": tc.function.arguments})
         
+        return {
+            "reasoning": getattr(message, "reasoning_content", "") or "",
+            "response": getattr(message, "content", "") or "",
+            "tool_calls": tool_calls
+        }
+
+    def _chat_stream(self, processed_messages: List[Dict[str, str]], **kwargs) -> Generator[Dict[str, Any], None, Dict[str, Any]]:
+        """
+        Override parent's _chat_stream to handle vLLM's incremental tool call streaming.
+        vLLM sends tool calls in multiple chunks that need to be accumulated.
+        """
+        response_stream = self.client.chat.completions.create(
+            model=self.model,
+            messages=processed_messages,
+            stream=True,
+            **self.formatted_params,
+            **kwargs
+        )
+        
+        agg_response = {"reasoning": "", "response": "", "tool_calls": []}
+        tool_call_accumulators = {}  # index -> {"id": str, "name": str, "arguments": str}
+        
+        for chunk in response_stream:
+            if len(chunk.choices) > 0:
+                chunk_dict = self._format_response(chunk)
+                
+                # Handle incremental tool call deltas - accumulate without yielding
+                if chunk_dict.get("type") == "tool_call_delta":
+                    for tc_delta in chunk_dict["data"]:
+                        idx = tc_delta["index"]
+                        if idx not in tool_call_accumulators:
+                            tool_call_accumulators[idx] = {"id": "", "name": "", "arguments": ""}
+                        
+                        # Accumulate non-None values
+                        if tc_delta["id"] is not None:
+                            tool_call_accumulators[idx]["id"] = tc_delta["id"]
+                        if tc_delta["name"] is not None:
+                            tool_call_accumulators[idx]["name"] = tc_delta["name"]
+                        if tc_delta["arguments"]:
+                            tool_call_accumulators[idx]["arguments"] += tc_delta["arguments"]
+                    
+                    # Don't yield incremental tool call deltas
+                    continue
+                
+                # Yield non-tool-call chunks normally
+                yield chunk_dict
+                
+                # Aggregate reasoning and response
+                if chunk_dict.get("type") == "reasoning":
+                    agg_response["reasoning"] += chunk_dict["data"]
+                elif chunk_dict.get("type") == "response":
+                    agg_response["response"] += chunk_dict["data"]
+                
+                if chunk.choices[0].finish_reason == "length":
+                    warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
+        
+        # After streaming completes, convert accumulated tool calls to final format
+        if tool_call_accumulators:
+            # Sort by index to maintain order
+            sorted_tool_calls = sorted(tool_call_accumulators.items(), key=lambda x: x[0])
+            agg_response["tool_calls"] = [
+                {"name": tc["name"], "arguments": tc["arguments"]}
+                for idx, tc in sorted_tool_calls
+            ]
+            # Yield the complete tool calls at the end
+            yield {"type": "tool_calls", "data": agg_response["tool_calls"]}
+        
+        return agg_response
+        
+    
 
 class SGLangInferenceEngine(OpenAICompatibleInferenceEngine):
     def __init__(self, model:str, api_key:str="", base_url:str="http://localhost:30000/v1", config:LLMConfig=None, 
@@ -1333,83 +1414,48 @@ class SGLangInferenceEngine(OpenAICompatibleInferenceEngine):
         max_requests_per_minute : int, Optional
             the maximum number of requests per minute.
         """
-        super().__init__(model=model, 
-                         api_key=api_key, 
-                         base_url=base_url, 
-                         config=config, 
+        super().__init__(model=model, api_key=api_key, base_url=base_url, config=config, 
                          max_concurrent_requests=max_concurrent_requests, 
-                         max_requests_per_minute=max_requests_per_minute, 
-                         **kwrs)
-
+                         max_requests_per_minute=max_requests_per_minute, **kwrs)
 
     def _format_response(self, response: Any) -> Dict[str, str]:
-        """
-        This method format the response (ChatCompletion or ChatCompletionChunk) from OpenAI API to a dict:
-        If streaming (ChatCompletionChunk), returns a dict with keys "type" and "data".
-        If non-streaming (ChatCompletion), returns a dict with keys "response", "reasoning", and "tool_calls".
-
-        Parameters:
-        ----------
-        response : Any
-            the response from OpenAI-compatible API. Could be a ChatCompletion or ChatCompletionChunk.
-
-        Returns:
-        -------
-        formatted_response : Dict[str, str]
-            If streaming, a dict {"type": <reasoning, response, or tool_calls>, "data": <content>}.
-            If non-streaming, a dict {"response": <response>, "reasoning": <reasoning>, "tool_calls": <tool_calls>}.
-            Tool calls are returned as List[{"name": <function_name>, "arguments": <function_arguments>}].
-        """
-        # Streaming response
+        """Format SGLang-specific responses."""
         if isinstance(response, self.ChatCompletionChunk):
             delta = response.choices[0].delta
             
-            # Tool call chunks
+            # Tool calls - SGLang returns complete tool call in single chunk
             if hasattr(delta, "tool_calls") and getattr(delta, "tool_calls") is not None:
                 if isinstance(delta.tool_calls, list):
                     tool_calls = []
                     for tool_call in delta.tool_calls:
                         function = tool_call.function
-                        function_name = function.name
-                        function_arguments = function.arguments
-                        tool_calls.append({"name": function_name, "arguments": function_arguments})
-              
+                        tool_calls.append({"name": function.name, "arguments": function.arguments})
                     return {"type": "tool_calls", "data": tool_calls}
             
-            # Reasoning content chunks
-            elif hasattr(delta, "reasoning_content") and getattr(delta, "reasoning_content") is not None:
-                chunk_text = getattr(delta, "reasoning_content", "")
-                if chunk_text is None:
-                    chunk_text = ""
+            # Reasoning content
+            if hasattr(delta, "reasoning_content") and getattr(delta, "reasoning_content") is not None:
+                chunk_text = getattr(delta, "reasoning_content", "") or ""
                 return {"type": "reasoning", "data": chunk_text}
             
-            # Response content chunks
-            else:
-                chunk_text = getattr(delta, "content", "")
-                if chunk_text is None:
-                    chunk_text = ""
-                return {"type": "response", "data": chunk_text}
+            # Response content
+            chunk_text = getattr(delta, "content", "") or ""
+            return {"type": "response", "data": chunk_text}
 
-        # Non-streaming response
-        elif isinstance(response, self.ChatCompletion):
-            message = response.choices[0].message
-            # Response extraction
-            response = message.content if hasattr(message, "content") else ""
-            response = response if response is not None else ""
-            # Reasoning extraction
-            reasoning = message.reasoning if hasattr(message, "reasoning") else ""
-            reasoning = reasoning if reasoning is not None else ""
-            # Tool calls extraction
-            tool_calls = []
-            if message.tool_calls:
-                for tool_call in message.tool_calls:
-                    function = tool_call.function
-                    function_name = function.name
-                    function_arguments = function.arguments
-                    tool_calls.append({"name": function_name, "arguments": function_arguments})
-            return {"response": response,
-                    "reasoning": reasoning,
-                    "tool_calls": tool_calls}
+        # Non-streaming
+        message = response.choices[0].message
+        response_text = message.content if hasattr(message, "content") else ""
+        response_text = response_text if response_text is not None else ""
+        reasoning = message.reasoning if hasattr(message, "reasoning") else ""
+        reasoning = reasoning if reasoning is not None else ""
+        
+        tool_calls = []
+        if message.tool_calls:
+            for tool_call in message.tool_calls:
+                function = tool_call.function
+                tool_calls.append({"name": function.name, "arguments": function.arguments})
+        
+        return {"response": response_text, "reasoning": reasoning, "tool_calls": tool_calls}
+    
     
 
 class OpenRouterInferenceEngine(OpenAICompatibleInferenceEngine):
@@ -1445,70 +1491,40 @@ class OpenRouterInferenceEngine(OpenAICompatibleInferenceEngine):
                          **kwrs)
 
     def _format_response(self, response: Any) -> Dict[str, str]:
-        """
-        This method format the response (ChatCompletion or ChatCompletionChunk) from OpenAI API to a dict:
-        If streaming (ChatCompletionChunk), returns a dict with keys "type" and "data".
-        If non-streaming (ChatCompletion), returns a dict with keys "response", "reasoning", and "tool_calls".
-
-        Parameters:
-        ----------
-        response : Any
-            the response from OpenAI-compatible API. Could be a ChatCompletion or ChatCompletionChunk.
-
-        Returns:
-        -------
-        formatted_response : Dict[str, str]
-            If streaming, a dict {"type": <reasoning, response, or tool_calls>, "data": <content>}.
-            If non-streaming, a dict {"response": <response>, "reasoning": <reasoning>, "tool_calls": <tool_calls>}.
-            Tool calls are returned as List[{"name": <function_name>, "arguments": <function_arguments>}].
-        """
-        # Streaming response
+        """Format SGLang-specific responses."""
         if isinstance(response, self.ChatCompletionChunk):
             delta = response.choices[0].delta
             
-            # Tool call chunks
+            # Tool calls - SGLang returns complete tool call in single chunk
             if hasattr(delta, "tool_calls") and getattr(delta, "tool_calls") is not None:
                 if isinstance(delta.tool_calls, list):
                     tool_calls = []
                     for tool_call in delta.tool_calls:
                         function = tool_call.function
-                        function_name = function.name
-                        function_arguments = function.arguments
-                        tool_calls.append({"name": function_name, "arguments": function_arguments})
-              
+                        tool_calls.append({"name": function.name, "arguments": function.arguments})
                     return {"type": "tool_calls", "data": tool_calls}
             
-            # Reasoning content chunks
-            elif hasattr(delta, "reasoning_content") and getattr(delta, "reasoning_content") is not None:
-                chunk_text = getattr(delta, "reasoning_content", "")
-                if chunk_text is None:
-                    chunk_text = ""
+            # Reasoning content
+            if hasattr(delta, "reasoning") and getattr(delta, "reasoning") is not None:
+                chunk_text = getattr(delta, "reasoning", "") or ""
                 return {"type": "reasoning", "data": chunk_text}
             
-            # Response content chunks
-            else:
-                chunk_text = getattr(delta, "content", "")
-                if chunk_text is None:
-                    chunk_text = ""
-                return {"type": "response", "data": chunk_text}
+            # Response content
+            chunk_text = getattr(delta, "content", "") or ""
+            return {"type": "response", "data": chunk_text}
 
-        # Non-streaming response
-        elif isinstance(response, self.ChatCompletion):
-            message = response.choices[0].message
-            # Response extraction
-            response = message.content if hasattr(message, "content") else ""
-            response = response if response is not None else ""
-            # Reasoning extraction
-            reasoning = message.reasoning if hasattr(message, "reasoning") else ""
-            reasoning = reasoning if reasoning is not None else ""
-            # Tool calls extraction
-            tool_calls = []
-            if message.tool_calls:
-                for tool_call in message.tool_calls:
-                    function = tool_call.function
-                    function_name = function.name
-                    function_arguments = function.arguments
-                    tool_calls.append({"name": function_name, "arguments": function_arguments})
-            return {"response": response,
-                    "reasoning": reasoning,
-                    "tool_calls": tool_calls}
+        # Non-streaming
+        message = response.choices[0].message
+        response_text = message.content if hasattr(message, "content") else ""
+        response_text = response_text if response_text is not None else ""
+        reasoning = message.reasoning if hasattr(message, "reasoning") else ""
+        reasoning = reasoning if reasoning is not None else ""
+        
+        tool_calls = []
+        if message.tool_calls:
+            for tool_call in message.tool_calls:
+                function = tool_call.function
+                tool_calls.append({"name": function.name, "arguments": function.arguments})
+        
+        return {"response": response_text, "reasoning": reasoning, "tool_calls": tool_calls}
+    
