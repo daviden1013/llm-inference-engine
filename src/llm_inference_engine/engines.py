@@ -826,10 +826,13 @@ class AzureOpenAIInferenceEngine(OpenAIInferenceEngine):
             raise ImportError("OpenAI Python API library not found. Please install OpanAI (```pip install openai```).")
         
         from openai import AzureOpenAI, AsyncAzureOpenAI
+        from openai.types.chat import ChatCompletionChunk, ChatCompletion
         self.api_version = api_version
         self.client = AzureOpenAI(api_version=api_version, **kwrs)
         self.async_client = AsyncAzureOpenAI(api_version=api_version, **kwrs)
         self.model = model
+        self.ChatCompletion = ChatCompletion
+        self.ChatCompletionChunk = ChatCompletionChunk
 
 
 class LiteLLMInferenceEngine(InferenceEngine):
