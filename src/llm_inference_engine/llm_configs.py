@@ -1,7 +1,7 @@
 import abc
 import re
 import warnings
-from typing import List, Dict, Union, Generator, Any
+from typing import List, Dict, Union, Generator, Any, AsyncGenerator
 
 
 class LLMConfig(abc.ABC):
@@ -32,18 +32,18 @@ class LLMConfig(abc.ABC):
         return NotImplemented
 
     @abc.abstractmethod
-    def postprocess_response(self, response:Union[str, Dict[str, Any], Generator[str, None, None]]) -> Union[Dict[str, Any], Generator[Dict[str, Any], None, None]]:
+    def postprocess_response(self, response:Union[str, Dict[str, Any], Generator[str, None, None], AsyncGenerator[str, None]]) -> Union[Dict[str, Any], Generator[Dict[str, Any], None, None], AsyncGenerator[Dict[str, Any], None]]:
         """
         This method postprocesses the LLM response after it is generated.
 
         Parameters:
         ----------
-        response : Union[str, Dict[str, Any], Generator[Dict[str, Any], None, None]]
-            the LLM response. Can be a dict or a generator. 
+        response : Union[str, Dict[str, Any], Generator[Dict[str, Any], None, None], AsyncGenerator[str, None]]
+            the LLM response. Can be a dict, a generator, or an async generator. 
         
         Returns:
         -------
-        response : Union[Dict[str, Any], Generator[Dict[str, Any], None, None]]
+        response : Union[Dict[str, Any], Generator[Dict[str, Any], None, None], AsyncGenerator[Dict[str, Any], None]]
             the postprocessed LLM response
         """
         return NotImplemented
@@ -76,19 +76,20 @@ class BasicLLMConfig(LLMConfig):
         """
         return messages.copy()
 
-    def postprocess_response(self, response:Union[str, Dict[str, Any], Generator[str, None, None]]) -> Union[Dict[str, Any], Generator[Dict[str, Any], None, None]]:
+    def postprocess_response(self, response:Union[str, Dict[str, Any], Generator[str, None, None], AsyncGenerator[str, None]]) -> Union[Dict[str, Any], Generator[Dict[str, Any], None, None], AsyncGenerator[Dict[str, Any], None]]:
         """
         This method postprocesses the LLM response after it is generated.
 
         Parameters:
         ----------
-        response : Union[str, Dict[str, Any], Generator[str, None, None]]
-            the LLM response. Can be a string or a generator.
+        response : Union[str, Dict[str, Any], Generator[str, None, None], AsyncGenerator[str, None]]
+            the LLM response. Can be a string, a generator, or an async generator.
         
-        Returns: Union[Dict[str,Any], Generator[Dict[str, Any], None, None]]
+        Returns: Union[Dict[str, Any], Generator[Dict[str, Any], None, None], AsyncGenerator[Dict[str, Any], None]]
             the postprocessed LLM response. 
-            If input is a string, the output will be a dict {"response": <response>}. 
+            if input is a string, the output will be a dict {"response": <response>}. 
             if input is a generator, the output will be a generator {"type": "response", "data": <content>}.
+            if input is an async generator, the output will be an async generator {"type": "response", "data": <content>}.
         """
         if isinstance(response, str):
             return {"response": response}
@@ -109,6 +110,16 @@ class BasicLLMConfig(LLMConfig):
                         yield {"type": "response", "data": chunk}
 
             return _process_stream()
+
+        elif isinstance(response, AsyncGenerator):
+            async def _process_async_stream():
+                async for chunk in response:
+                    if isinstance(chunk, dict):
+                        yield chunk
+                    elif isinstance(chunk, str):
+                        yield {"type": "response", "data": chunk}
+            
+            return _process_async_stream()
 
         else:
             warnings.warn(f"Invalid response type: {type(response)}. Returning default empty dict.", UserWarning)
@@ -139,7 +150,7 @@ class ReasoningLLMConfig(LLMConfig):
         """
         return messages.copy()
 
-    def postprocess_response(self, response:Union[str, Dict[str, str], Generator[str, None, None]]) -> Union[Dict[str,str], Generator[Dict[str,str], None, None]]:
+    def postprocess_response(self, response:Union[str, Dict[str, str], Generator[str, None, None], AsyncGenerator[str, None]]) -> Union[Dict[str,str], Generator[Dict[str,str], None, None], AsyncGenerator[Dict[str,str], None]]:
         """
         This method postprocesses the LLM response after it is generated.
         1. If input is a string, it will extract the reasoning and response based on the thinking tokens.
@@ -201,6 +212,33 @@ class ReasoningLLMConfig(LLMConfig):
                                 yield {"type": "response", "data": chunk}
 
             return _process_stream()
+
+        elif isinstance(response, AsyncGenerator):
+            async def _process_async_stream():
+                think_flag = False
+                buffer = ""
+                async for chunk in response:
+                    if isinstance(chunk, dict):
+                        yield chunk
+
+                    elif isinstance(chunk, str):
+                        buffer += chunk
+                        # switch between reasoning and response
+                        if self.thinking_token_start in buffer:
+                            think_flag = True
+                            buffer = buffer.replace(self.thinking_token_start, "")
+                        elif self.thinking_token_end in buffer:
+                            think_flag = False
+                            buffer = buffer.replace(self.thinking_token_end, "")
+                        
+                        # if chunk is in thinking block, tag it as reasoning; else tag it as response
+                        if chunk not in [self.thinking_token_start, self.thinking_token_end]:
+                            if think_flag:
+                                yield {"type": "reasoning", "data": chunk}
+                            else:
+                                yield {"type": "response", "data": chunk}
+            
+            return _process_async_stream()
         
         else:
             warnings.warn(f"Invalid response type: {type(response)}. Returning default empty dict.", UserWarning)

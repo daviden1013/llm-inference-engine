@@ -2,7 +2,7 @@ import abc
 import os
 import warnings
 import importlib.util
-from typing import Any, List, Dict, Union, Generator
+from typing import Any, List, Dict, Union, Generator, AsyncGenerator
 from llm_inference_engine.utils import MessagesLogger, ConcurrencyLimiter, SlideWindowRateLimiter
 from llm_inference_engine.llm_configs import LLMConfig, BasicLLMConfig
 
@@ -44,10 +44,10 @@ class InferenceEngine:
 
 
     @abc.abstractmethod
-    def chat(self, messages:List[Dict[str,str]], verbose:bool=False, stream:bool=False, 
-             messages_logger:MessagesLogger=None) -> Union[Dict[str,str], Generator[Dict[str, str], None, None]]:
+    def chat(self, messages:List[Dict[str,str]], verbose:bool=False, 
+             messages_logger:MessagesLogger=None) -> Dict[str,str]:
         """
-        This method inputs chat messages and outputs LLM generated text.
+        This method inputs chat messages and outputs LLM generated text synchronously.
 
         Parameters:
         ----------
@@ -55,15 +55,37 @@ class InferenceEngine:
             a list of dict with role and content. role must be one of {"system", "user", "assistant"}
         verbose : bool, Optional
             if True, LLM generated text will be printed in terminal in real-time.
-        stream : bool, Optional
-            if True, returns a generator that yields the output in real-time.  
-        Messages_logger : MessagesLogger, Optional
+        messages_logger : MessagesLogger, Optional
             the message logger that logs the chat messages.
 
         Returns:
         -------
-        response : Union[Dict[str,str], Generator[Dict[str, str], None, None]]
-            a dict {"reasoning": <reasoning>, "response": <response>} or Generator {"type": <reasoning or response>, "data": <content>}
+        response : Dict[str,str]
+            a dict {"reasoning": <reasoning>, "response": <response>}
+        """
+        return NotImplemented
+
+    @abc.abstractmethod
+    def chat_stream(self, messages:List[Dict[str,str]], 
+                    messages_logger:MessagesLogger=None) -> Generator[Dict[str, str], None, None]:
+        """
+        This method inputs chat messages and returns a generator for LLM generated text synchronously.
+        """
+        return NotImplemented
+
+    @abc.abstractmethod
+    async def chat_async(self, messages:List[Dict[str,str]], 
+                         messages_logger:MessagesLogger=None) -> Dict[str,str]:
+        """
+        This method inputs chat messages and outputs LLM generated text asynchronously.
+        """
+        return NotImplemented
+
+    @abc.abstractmethod
+    async def chat_async_stream(self, messages:List[Dict[str,str]], 
+                                messages_logger:MessagesLogger=None) -> AsyncGenerator[Dict[str, str], None]:
+        """
+        This method inputs chat messages and returns an async generator for LLM generated text asynchronously.
         """
         return NotImplemented
 
@@ -121,71 +143,11 @@ class OllamaInferenceEngine(InferenceEngine):
 
         return formatted_params
 
-    def chat(self, messages:List[Dict[str,str]], verbose:bool=False, stream:bool=False, 
-             messages_logger:MessagesLogger=None) -> Union[Dict[str,str], Generator[Dict[str, str], None, None]]:
-        """
-        This method inputs chat messages and outputs VLM generated text.
-
-        Parameters:
-        ----------
-        messages : List[Dict[str,str]]
-            a list of dict with role and content. role must be one of {"system", "user", "assistant"}
-        verbose : bool, Optional
-            if True, VLM generated text will be printed in terminal in real-time.
-        stream : bool, Optional
-            if True, returns a generator that yields the output in real-time.
-        Messages_logger : MessagesLogger, Optional
-            the message logger that logs the chat messages.
-
-        Returns:
-        -------
-        response : Union[Dict[str,str], Generator[Dict[str, str], None, None]]
-            a dict {"reasoning": <reasoning>, "response": <response>} or Generator {"type": <reasoning or response>, "data": <content>}
-        """
+    def chat(self, messages:List[Dict[str,str]], verbose:bool=False, messages_logger:MessagesLogger=None) -> Dict[str,str]:
         processed_messages = self.config.preprocess_messages(messages)
-
         options={'num_ctx': self.num_ctx, **self.formatted_params}
-        if stream:
-            def _stream_generator():
-                response_stream = self.client.chat(
-                    model=self.model_name, 
-                    messages=processed_messages, 
-                    options=options,
-                    stream=True, 
-                    keep_alive=self.keep_alive
-                )
-                res = {"reasoning": "", "response": ""}
-                for chunk in response_stream:
-                    if hasattr(chunk.message, 'thinking') and chunk.message.thinking:
-                        content_chunk = getattr(getattr(chunk, 'message', {}), 'thinking', '')
-                        res["reasoning"] += content_chunk
-                        yield {"type": "reasoning", "data": content_chunk}
-                    else:
-                        content_chunk = getattr(getattr(chunk, 'message', {}), 'content', '')
-                        res["response"] += content_chunk
-                        yield {"type": "response", "data": content_chunk}
 
-                    if chunk.done_reason == "length":
-                        warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
-                
-                # Postprocess response
-                res_dict = self.config.postprocess_response(res)
-                # Write to messages log
-                if messages_logger:
-                    # replace images content with a placeholder "[image]" to save space
-                    if not messages_logger.store_images:
-                        for messages in processed_messages:
-                            if "images" in messages:
-                                messages["images"] = ["[image]" for _ in messages["images"]]
-
-                    processed_messages.append({"role": "assistant",
-                                                "content": res_dict.get("response", ""),
-                                                "reasoning": res_dict.get("reasoning", "")})
-                    messages_logger.log_messages(processed_messages)
-
-            return self.config.postprocess_response(_stream_generator())
-
-        elif verbose:
+        if verbose:
             response = self.client.chat(
                             model=self.model_name, 
                             messages=processed_messages, 
@@ -233,21 +195,40 @@ class OllamaInferenceEngine(InferenceEngine):
 
         # Postprocess response
         res_dict = self.config.postprocess_response(res)
-        # Write to messages log
-        if messages_logger:
-            # replace images content with a placeholder "[image]" to save space
-            if not messages_logger.store_images:
-                for messages in processed_messages:
-                    if "images" in messages:
-                        messages["images"] = ["[image]" for _ in messages["images"]]
-
-            processed_messages.append({"role": "assistant", 
-                                    "content": res_dict.get("response", ""), 
-                                    "reasoning": res_dict.get("reasoning", "")})
-            messages_logger.log_messages(processed_messages)
-
+        self._log_messages(processed_messages, res_dict, messages_logger)
         return res_dict
-        
+
+    def chat_stream(self, messages:List[Dict[str,str]], messages_logger:MessagesLogger=None) -> Generator[Dict[str, str], None, None]:
+        processed_messages = self.config.preprocess_messages(messages)
+        options={'num_ctx': self.num_ctx, **self.formatted_params}
+
+        def _stream_generator():
+            response_stream = self.client.chat(
+                model=self.model_name, 
+                messages=processed_messages, 
+                options=options,
+                stream=True, 
+                keep_alive=self.keep_alive
+            )
+            res = {"reasoning": "", "response": ""}
+            for chunk in response_stream:
+                if hasattr(chunk.message, 'thinking') and chunk.message.thinking:
+                    content_chunk = getattr(getattr(chunk, 'message', {}), 'thinking', '')
+                    res["reasoning"] += content_chunk
+                    yield {"type": "reasoning", "data": content_chunk}
+                else:
+                    content_chunk = getattr(getattr(chunk, 'message', {}), 'content', '')
+                    res["response"] += content_chunk
+                    yield {"type": "response", "data": content_chunk}
+
+                if chunk.done_reason == "length":
+                    warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
+            
+            # Postprocess response for logging
+            res_dict = self.config.postprocess_response(res)
+            self._log_messages(processed_messages, res_dict, messages_logger)
+
+        return self.config.postprocess_response(_stream_generator())
 
     async def chat_async(self, messages:List[Dict[str,str]], messages_logger:MessagesLogger=None) -> Dict[str,str]:
         """
@@ -275,25 +256,69 @@ class OllamaInferenceEngine(InferenceEngine):
             
             if response.done_reason == "length":
                 warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
-            # Postprocess response
+            
             res_dict = self.config.postprocess_response(res)
-            # Write to messages log
-            if messages_logger:
-                # replace images content with a placeholder "[image]" to save space
-                if not messages_logger.store_images:
-                    for messages in processed_messages:
-                        if "images" in messages:
-                            messages["images"] = ["[image]" for _ in messages["images"]]
-
-                processed_messages.append({"role": "assistant", 
-                                            "content": res_dict.get("response", ""), 
-                                            "reasoning": res_dict.get("reasoning", "")})
-                messages_logger.log_messages(processed_messages)
-
+            self._log_messages(processed_messages, res_dict, messages_logger)
             return res_dict
         finally:
             if self.concurrency_limiter:
                 self.concurrency_limiter.release()
+
+    async def chat_async_stream(self, messages:List[Dict[str,str]], messages_logger:MessagesLogger=None) -> AsyncGenerator[Dict[str, str], None]:
+        """
+        Async version of chat_stream method.
+        """
+        if self.concurrency_limiter:
+            await self.concurrency_limiter.acquire()
+        
+        async def _stream_generator():
+            try:
+                if self.rate_limiter:
+                    await self.rate_limiter.acquire()
+
+                processed_messages = self.config.preprocess_messages(messages)
+                options = {'num_ctx': self.num_ctx, **self.formatted_params}
+
+                response_stream = await self.async_client.chat(
+                    model=self.model_name, 
+                    messages=processed_messages, 
+                    options=options,
+                    stream=True, 
+                    keep_alive=self.keep_alive
+                )
+                res = {"reasoning": "", "response": ""}
+                async for chunk in response_stream:
+                    if hasattr(chunk.message, 'thinking') and chunk.message.thinking:
+                        content_chunk = getattr(getattr(chunk, 'message', {}), 'thinking', '')
+                        res["reasoning"] += content_chunk
+                        yield {"type": "reasoning", "data": content_chunk}
+                    else:
+                        content_chunk = getattr(getattr(chunk, 'message', {}), 'content', '')
+                        res["response"] += content_chunk
+                        yield {"type": "response", "data": content_chunk}
+
+                    if chunk.done_reason == "length":
+                        warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
+
+                res_dict = self.config.postprocess_response(res)
+                self._log_messages(processed_messages, res_dict, messages_logger)
+            finally:
+                if self.concurrency_limiter:
+                    self.concurrency_limiter.release()
+
+        return self.config.postprocess_response(_stream_generator())
+
+    def _log_messages(self, processed_messages: List[Dict[str, str]], res_dict: Dict[str, str], messages_logger: MessagesLogger):
+        if messages_logger:
+            if not messages_logger.store_images:
+                for messages in processed_messages:
+                    if "images" in messages:
+                        messages["images"] = ["[image]" for _ in messages["images"]]
+
+            processed_messages.append({"role": "assistant",
+                                        "content": res_dict.get("response", ""),
+                                        "reasoning": res_dict.get("reasoning", "")})
+            messages_logger.log_messages(processed_messages)
 
 
 class HuggingFaceHubInferenceEngine(InferenceEngine):
@@ -343,63 +368,10 @@ class HuggingFaceHubInferenceEngine(InferenceEngine):
         return formatted_params
 
 
-    def chat(self, messages:List[Dict[str,str]], verbose:bool=False, stream:bool=False, 
-             messages_logger:MessagesLogger=None) -> Union[Dict[str,str], Generator[Dict[str, str], None, None]]:
-        """
-        This method inputs chat messages and outputs LLM generated text.
-
-        Parameters:
-        ----------
-        messages : List[Dict[str,str]]
-            a list of dict with role and content. role must be one of {"system", "user", "assistant"}
-        verbose : bool, Optional
-            if True, VLM generated text will be printed in terminal in real-time.
-        stream : bool, Optional
-            if True, returns a generator that yields the output in real-time.
-        messages_logger : MessagesLogger, Optional
-            the message logger that logs the chat messages.
-            
-        Returns:
-        -------
-        response : Union[Dict[str,str], Generator[Dict[str, str], None, None]]
-            a dict {"reasoning": <reasoning>, "response": <response>} or Generator {"type": <reasoning or response>, "data": <content>}
-        """
+    def chat(self, messages:List[Dict[str,str]], verbose:bool=False, messages_logger:MessagesLogger=None) -> Dict[str,str]:
         processed_messages = self.config.preprocess_messages(messages)
 
-        if stream:
-            def _stream_generator():
-                response_stream = self.client.chat.completions.create(
-                                    messages=processed_messages,
-                                    stream=True,
-                                    **self.formatted_params
-                                )
-                res_text = ""
-                for chunk in response_stream:
-                    content_chunk = chunk.get('choices')[0].get('delta').get('content')
-                    if content_chunk:
-                        res_text += content_chunk
-                        yield content_chunk
-
-                # Postprocess response
-                res_dict = self.config.postprocess_response(res_text)
-                # Write to messages log
-                if messages_logger:
-                    # replace images content with a placeholder "[image]" to save space
-                    if not messages_logger.store_images:
-                        for messages in processed_messages:
-                            if "content" in messages and isinstance(messages["content"], list):
-                                for content in messages["content"]:
-                                    if isinstance(content, dict) and content.get("type") == "image_url":
-                                        content["image_url"]["url"] = "[image]"
-
-                    processed_messages.append({"role": "assistant",
-                                                "content": res_dict.get("response", ""),
-                                                "reasoning": res_dict.get("reasoning", "")})
-                    messages_logger.log_messages(processed_messages)
-
-            return self.config.postprocess_response(_stream_generator())
-        
-        elif verbose:
+        if verbose:
             response = self.client.chat.completions.create(
                             messages=processed_messages,
                             stream=True,
@@ -412,7 +384,7 @@ class HuggingFaceHubInferenceEngine(InferenceEngine):
                 if content_chunk:
                     res += content_chunk
                     print(content_chunk, end='', flush=True)
-
+            print('\n')
         
         else:
             response = self.client.chat.completions.create(
@@ -422,29 +394,37 @@ class HuggingFaceHubInferenceEngine(InferenceEngine):
                             )
             res = response.choices[0].message.content
 
-        # Postprocess response
         res_dict = self.config.postprocess_response(res)
-        # Write to messages log
-        if messages_logger:
-            # replace images content with a placeholder "[image]" to save space
-            if not messages_logger.store_images:
-                for messages in processed_messages:
-                    if "content" in messages and isinstance(messages["content"], list):
-                        for content in messages["content"]:
-                            if isinstance(content, dict) and content.get("type") == "image_url":
-                                content["image_url"]["url"] = "[image]"
-
-            processed_messages.append({"role": "assistant", 
-                                       "content": res_dict.get("response", ""), 
-                                       "reasoning": res_dict.get("reasoning", "")})
-            messages_logger.log_messages(processed_messages)
-
+        self._log_messages(processed_messages, res_dict, messages_logger)
         return res_dict
     
-    
+    def chat_stream(self, messages:List[Dict[str,str]], messages_logger:MessagesLogger=None) -> Generator[Dict[str, str], None, None]:
+        """
+        This method inputs chat messages and returns a generator for LLM generated text synchronously.
+        """
+        processed_messages = self.config.preprocess_messages(messages)
+
+        def _stream_generator():
+            response_stream = self.client.chat.completions.create(
+                                messages=processed_messages,
+                                stream=True,
+                                **self.formatted_params
+                            )
+            res_text = ""
+            for chunk in response_stream:
+                content_chunk = chunk.get('choices')[0].get('delta').get('content')
+                if content_chunk:
+                    res_text += content_chunk
+                    yield content_chunk
+
+            res_dict = self.config.postprocess_response(res_text)
+            self._log_messages(processed_messages, res_dict, messages_logger)
+
+        return self.config.postprocess_response(_stream_generator())
+
     async def chat_async(self, messages:List[Dict[str,str]], messages_logger:MessagesLogger=None) -> Dict[str,str]:
         """
-        Async version of chat method. Streaming is not supported.
+        Async version of chat method.
         """
         if self.concurrency_limiter:
             await self.concurrency_limiter.acquire()
@@ -460,27 +440,60 @@ class HuggingFaceHubInferenceEngine(InferenceEngine):
                     )
         
             res = response.choices[0].message.content
-            # Postprocess response
             res_dict = self.config.postprocess_response(res)
-            # Write to messages log
-            if messages_logger:
-                # replace images content with a placeholder "[image]" to save space
-                if not messages_logger.store_images:
-                    for messages in processed_messages:
-                        if "content" in messages and isinstance(messages["content"], list):
-                            for content in messages["content"]:
-                                if isinstance(content, dict) and content.get("type") == "image_url":
-                                    content["image_url"]["url"] = "[image]"
-
-                processed_messages.append({"role": "assistant", 
-                                           "content": res_dict.get("response", ""), 
-                                           "reasoning": res_dict.get("reasoning", "")})
-                messages_logger.log_messages(processed_messages)
-
+            self._log_messages(processed_messages, res_dict, messages_logger)
             return res_dict
         finally:
             if self.concurrency_limiter:
                 self.concurrency_limiter.release()
+
+    async def chat_async_stream(self, messages:List[Dict[str,str]], messages_logger:MessagesLogger=None) -> AsyncGenerator[Dict[str, str], None]:
+        """
+        Async version of chat method with streaming support.
+        """
+        if self.concurrency_limiter:
+            await self.concurrency_limiter.acquire()
+
+        async def _stream_generator():
+            try:
+                if self.rate_limiter:
+                    await self.rate_limiter.acquire()
+                processed_messages = self.config.preprocess_messages(messages)
+
+                response_stream = await self.client_async.chat.completions.create(
+                                    messages=processed_messages,
+                                    stream=True,
+                                    **self.formatted_params
+                                )
+                res_text = ""
+                async for chunk in response_stream:
+                    content_chunk = chunk.get('choices')[0].get('delta').get('content')
+                    if content_chunk:
+                        res_text += content_chunk
+                        yield content_chunk
+                
+                res_dict = self.config.postprocess_response(res_text)
+                self._log_messages(processed_messages, res_dict, messages_logger)
+            finally:
+                if self.concurrency_limiter:
+                    self.concurrency_limiter.release()
+
+        return self.config.postprocess_response(_stream_generator())
+
+    def _log_messages(self, processed_messages: List[Dict[str, str]], res_dict: Dict[str, str], messages_logger: MessagesLogger):
+        if messages_logger:
+            if not messages_logger.store_images:
+                for messages in processed_messages:
+                    if "content" in messages and isinstance(messages["content"], list):
+                        for content in messages["content"]:
+                            if isinstance(content, dict) and content.get("type") == "image_url":
+                                content["image_url"]["url"] = "[image]"
+
+            processed_messages.append({"role": "assistant", 
+                                       "content": res_dict.get("response", ""), 
+                                       "reasoning": res_dict.get("reasoning", "")})
+            messages_logger.log_messages(processed_messages)
+
 
 class OpenAIInferenceEngine(InferenceEngine):
     def __init__(self, model:str, config:LLMConfig=None, max_concurrent_requests:int=None, max_requests_per_minute:int=None, **kwrs):
@@ -525,17 +538,12 @@ class OpenAIInferenceEngine(InferenceEngine):
     def _format_response(self, response: Any) -> Dict[str, str]:
         """
         Format OpenAI API response (ChatCompletion or ChatCompletionChunk) to a standardized dict.
-        
-        For streaming (ChatCompletionChunk), returns:
-            {"type": "response" | "tool_call_delta", "data": <content>}
-        For non-streaming (ChatCompletion), returns:
-            {"response": str, "reasoning": str, "tool_calls": list}
         """
         # Streaming response
         if isinstance(response, self.ChatCompletionChunk):
             delta = response.choices[0].delta
             
-            # Tool call chunks - OpenAI streams incrementally
+            # Tool call chunks
             if hasattr(delta, "tool_calls") and delta.tool_calls is not None:
                 if isinstance(delta.tool_calls, list) and len(delta.tool_calls) > 0:
                     tool_call_deltas = []
@@ -548,23 +556,20 @@ class OpenAIInferenceEngine(InferenceEngine):
                         })
                     return {"type": "tool_call_delta", "data": tool_call_deltas}
             
-            # Response content chunks (OpenAI doesn't have reasoning_content)
+            # Response content chunks
             chunk_text = getattr(delta, "content", "") or ""
             return {"type": "response", "data": chunk_text}
 
         # Non-streaming response
         message = response.choices[0].message
         
-        # Response extraction
         response_text = message.content if hasattr(message, "content") else ""
         response_text = response_text if response_text is not None else ""
         
-        # Reasoning extraction (OpenAI o1 models may have this)
         reasoning = ""
         if hasattr(message, "reasoning"):
             reasoning = message.reasoning if message.reasoning is not None else ""
         
-        # Tool calls extraction
         tool_calls = []
         if hasattr(message, "tool_calls") and message.tool_calls is not None:
             for tc in message.tool_calls:
@@ -580,7 +585,6 @@ class OpenAIInferenceEngine(InferenceEngine):
         }
 
     def _log_messages(self, processed_messages: List[Dict[str, str]], res_dict: Dict[str, str], messages_logger: MessagesLogger):
-        """Helper method to log messages."""
         if not messages_logger.store_images:
             for msg in processed_messages:
                 if "content" in msg and isinstance(msg["content"], list):
@@ -596,17 +600,8 @@ class OpenAIInferenceEngine(InferenceEngine):
         })
         messages_logger.log_messages(processed_messages)
 
-    def _chat_stream(self, processed_messages: List[Dict[str, str]], **kwargs) -> Generator[Dict[str, Any], None, Dict[str, Any]]:
-        """
-        Helper method for streaming chat responses.
-        Handles OpenAI's incremental tool call streaming.
-        
-        Yields:
-            {"type": "response" | "tool_calls", "data": <content>}
-        
-        Returns:
-            Aggregated response dict with keys: response, reasoning, tool_calls
-        """
+    def _chat_stream_helper(self, processed_messages: List[Dict[str, str]], **kwargs) -> Generator[Dict[str, Any], None, Dict[str, Any]]:
+        """Helper method for streaming chat responses."""
         response_stream = self.client.chat.completions.create(
             model=self.model,
             messages=processed_messages,
@@ -616,101 +611,103 @@ class OpenAIInferenceEngine(InferenceEngine):
         )
         
         agg_response = {"reasoning": "", "response": "", "tool_calls": []}
-        tool_call_accumulators = {}  # index -> {"id": str, "name": str, "arguments": str}
+        tool_call_accumulators = {}
         
         for chunk in response_stream:
             if len(chunk.choices) > 0:
                 chunk_dict = self._format_response(chunk)
                 
-                # Handle incremental tool call deltas - accumulate without yielding
+                # Handle incremental tool call deltas
                 if chunk_dict.get("type") == "tool_call_delta":
                     for tc_delta in chunk_dict["data"]:
                         idx = tc_delta["index"]
                         if idx not in tool_call_accumulators:
                             tool_call_accumulators[idx] = {"id": "", "name": "", "arguments": ""}
                         
-                        # Accumulate non-None values
                         if tc_delta["id"] is not None:
                             tool_call_accumulators[idx]["id"] = tc_delta["id"]
                         if tc_delta["name"] is not None:
                             tool_call_accumulators[idx]["name"] = tc_delta["name"]
                         if tc_delta["arguments"]:
                             tool_call_accumulators[idx]["arguments"] += tc_delta["arguments"]
-                    
-                    # Don't yield incremental tool call deltas
                     continue
                 
-                # Yield non-tool-call chunks normally
                 yield chunk_dict
                 
-                # Aggregate response
                 if chunk_dict.get("type") == "response":
                     agg_response["response"] += chunk_dict["data"]
                 
                 if chunk.choices[0].finish_reason == "length":
                     warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
         
-        # After streaming completes, convert accumulated tool calls to final format
         if tool_call_accumulators:
             sorted_tool_calls = sorted(tool_call_accumulators.items(), key=lambda x: x[0])
             agg_response["tool_calls"] = [
                 {"name": tc["name"], "arguments": tc["arguments"]}
                 for idx, tc in sorted_tool_calls
             ]
-            # Yield the complete tool calls at the end
             yield {"type": "tool_calls", "data": agg_response["tool_calls"]}
         
         return agg_response
 
-    def chat(self, messages: List[Dict[str, str]], verbose: bool = False, stream: bool = False, 
-             messages_logger: MessagesLogger = None, **kwargs) -> Union[Dict[str, str], Generator[Dict[str, str], None, None]]:
-        """
-        This method inputs chat messages and outputs LLM generated text.
+    async def _chat_async_stream_helper(self, processed_messages: List[Dict[str, str]], **kwargs) -> AsyncGenerator[Dict[str, Any], Dict[str, Any]]:
+        """Async Helper method for streaming chat responses."""
+        response_stream = await self.async_client.chat.completions.create(
+            model=self.model,
+            messages=processed_messages,
+            stream=True,
+            **self.formatted_params,
+            **kwargs
+        )
+        
+        agg_response = {"reasoning": "", "response": "", "tool_calls": []}
+        tool_call_accumulators = {}
+        
+        async for chunk in response_stream:
+            if len(chunk.choices) > 0:
+                chunk_dict = self._format_response(chunk)
+                
+                if chunk_dict.get("type") == "tool_call_delta":
+                    for tc_delta in chunk_dict["data"]:
+                        idx = tc_delta["index"]
+                        if idx not in tool_call_accumulators:
+                            tool_call_accumulators[idx] = {"id": "", "name": "", "arguments": ""}
+                        
+                        if tc_delta["id"] is not None:
+                            tool_call_accumulators[idx]["id"] = tc_delta["id"]
+                        if tc_delta["name"] is not None:
+                            tool_call_accumulators[idx]["name"] = tc_delta["name"]
+                        if tc_delta["arguments"]:
+                            tool_call_accumulators[idx]["arguments"] += tc_delta["arguments"]
+                    continue
+                
+                yield chunk_dict
+                
+                if chunk_dict.get("type") == "response":
+                    agg_response["response"] += chunk_dict["data"]
+                
+                if chunk.choices[0].finish_reason == "length":
+                    warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
+        
+        if tool_call_accumulators:
+            sorted_tool_calls = sorted(tool_call_accumulators.items(), key=lambda x: x[0])
+            agg_response["tool_calls"] = [
+                {"name": tc["name"], "arguments": tc["arguments"]}
+                for idx, tc in sorted_tool_calls
+            ]
+            yield {"type": "tool_calls", "data": agg_response["tool_calls"]}
+        
 
-        Parameters:
-        ----------
-        messages : List[Dict[str,str]]
-            a list of dict with role and content. role must be one of {"system", "user", "assistant"}
-        verbose : bool, Optional
-            if True, LLM generated text will be printed in terminal in real-time.
-        stream : bool, Optional
-            if True, returns a generator that yields the output in real-time.
-        messages_logger : MessagesLogger, Optional
-            the message logger that logs the chat messages.
-
-        Returns:
-        -------
-        response : Union[Dict[str,str], Generator[Dict[str, str], None, None]]
-            a dict {"reasoning": <reasoning>, "response": <response>, "tool_calls": <tool_calls>} 
-            or Generator {"type": <response or tool_calls>, "data": <content>}
-        """
+    def chat(self, messages: List[Dict[str, str]], verbose: bool = False, 
+             messages_logger: MessagesLogger = None, **kwargs) -> Dict[str, str]:
+        
         processed_messages = self.config.preprocess_messages(messages)
 
-        if stream:
-            def _stream_generator():
-                stream_gen = self._chat_stream(processed_messages, **kwargs)
-                agg_response = None
-                
-                try:
-                    while True:
-                        chunk_dict = next(stream_gen)
-                        yield chunk_dict
-                except StopIteration as e:
-                    agg_response = e.value
-                
-                # Postprocess and log
-                agg_response = agg_response if agg_response is not None else {"reasoning": "", "response": "", "tool_calls": []}
-                res_dict = self.config.postprocess_response(agg_response)
-                if messages_logger:
-                    self._log_messages(processed_messages, res_dict, messages_logger)
-
-            return self.config.postprocess_response(_stream_generator())
-
-        elif verbose:
+        if verbose:
             phase = ""
             agg_response = None
             
-            stream_gen = self._chat_stream(processed_messages, **kwargs)
+            stream_gen = self._chat_stream_helper(processed_messages, **kwargs)
             
             try:
                 while True:
@@ -718,9 +715,7 @@ class OpenAIInferenceEngine(InferenceEngine):
                     chunk_type = chunk_dict["type"]
                     chunk_data = chunk_dict["data"]
                     
-                    # Print with phase headers
                     if chunk_type == "tool_calls":
-                        # Tool calls come as complete list at the end
                         for tool_call in chunk_data:
                             print(f"\n--- Tool Call: {tool_call['name']} ---")
                             print(f"Arguments: {tool_call['arguments']}")
@@ -735,8 +730,8 @@ class OpenAIInferenceEngine(InferenceEngine):
             
             print('\n')
             agg_response = agg_response if agg_response is not None else {"reasoning": "", "response": "", "tool_calls": []}
-            formatted_response = agg_response
-
+            res_dict = self.config.postprocess_response(agg_response)
+        
         else:
             chat_completion = self.client.chat.completions.create(
                 model=self.model,
@@ -750,20 +745,34 @@ class OpenAIInferenceEngine(InferenceEngine):
                 warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
 
             formatted_response = self._format_response(chat_completion)
-            
-        # Postprocess response by config
-        res_dict = self.config.postprocess_response(formatted_response)
+            res_dict = self.config.postprocess_response(formatted_response)
         
-        # Write to messages log
         if messages_logger:
             self._log_messages(processed_messages, res_dict, messages_logger)
 
         return res_dict
 
+    def chat_stream(self, messages: List[Dict[str, str]], messages_logger: MessagesLogger = None, **kwargs) -> Generator[Dict[str, str], None, None]:
+        processed_messages = self.config.preprocess_messages(messages)
+
+        def _stream_generator():
+            stream_gen = self._chat_stream_helper(processed_messages, **kwargs)
+            agg_response = None
+            try:
+                while True:
+                    chunk_dict = next(stream_gen)
+                    yield chunk_dict
+            except StopIteration as e:
+                agg_response = e.value
+            
+            agg_response = agg_response if agg_response is not None else {"reasoning": "", "response": "", "tool_calls": []}
+            res_dict = self.config.postprocess_response(agg_response)
+            if messages_logger:
+                self._log_messages(processed_messages, res_dict, messages_logger)
+
+        return self.config.postprocess_response(_stream_generator())
+
     async def chat_async(self, messages: List[Dict[str, str]], messages_logger: MessagesLogger = None, **kwargs) -> Dict[str, str]:
-        """
-        Async version of chat method. Streaming is not supported.
-        """
         if self.concurrency_limiter:
             await self.concurrency_limiter.acquire()
         try:
@@ -783,11 +792,8 @@ class OpenAIInferenceEngine(InferenceEngine):
                 warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
 
             formatted_response = self._format_response(chat_completion)
-
-            # Postprocess response by config
             res_dict = self.config.postprocess_response(formatted_response)
             
-            # Write to messages log
             if messages_logger:
                 self._log_messages(processed_messages, res_dict, messages_logger)
 
@@ -795,7 +801,39 @@ class OpenAIInferenceEngine(InferenceEngine):
         finally:
             if self.concurrency_limiter:
                 self.concurrency_limiter.release()
-             
+
+    async def chat_async_stream(self, messages: List[Dict[str, str]], messages_logger: MessagesLogger = None, **kwargs) -> AsyncGenerator[Dict[str, str], None]:
+        if self.concurrency_limiter:
+            await self.concurrency_limiter.acquire()
+
+        async def _stream_generator():
+            try:
+                if self.rate_limiter:
+                    await self.rate_limiter.acquire()
+                processed_messages = self.config.preprocess_messages(messages)
+
+                # We need to manually aggregate for logging since async generators don't return values like sync StopIteration
+                agg_response = {"reasoning": "", "response": "", "tool_calls": []}
+                
+                async for chunk_dict in self._chat_async_stream_helper(processed_messages, **kwargs):
+                    yield chunk_dict
+                    
+                    if chunk_dict.get("type") == "reasoning":
+                        agg_response["reasoning"] += chunk_dict["data"]
+                    elif chunk_dict.get("type") == "response":
+                        agg_response["response"] += chunk_dict["data"]
+                    elif chunk_dict.get("type") == "tool_calls":
+                        agg_response["tool_calls"].extend(chunk_dict["data"])
+                
+                res_dict = self.config.postprocess_response(agg_response)
+                if messages_logger:
+                    self._log_messages(processed_messages, res_dict, messages_logger)
+            finally:
+                if self.concurrency_limiter:
+                    self.concurrency_limiter.release()
+
+        return self.config.postprocess_response(_stream_generator())
+
 
 class AzureOpenAIInferenceEngine(OpenAIInferenceEngine):
     def __init__(self, model:str, api_version:str, config:LLMConfig=None, max_concurrent_requests:int=None, max_requests_per_minute:int=None, **kwrs):
@@ -878,65 +916,10 @@ class LiteLLMInferenceEngine(InferenceEngine):
 
         return formatted_params
 
-    def chat(self, messages:List[Dict[str,str]], verbose:bool=False, stream:bool=False, messages_logger:MessagesLogger=None) -> Union[Dict[str,str], Generator[Dict[str, str], None, None]]:
-        """
-        This method inputs chat messages and outputs LLM generated text.
-
-        Parameters:
-        ----------
-        messages : List[Dict[str,str]]
-            a list of dict with role and content. role must be one of {"system", "user", "assistant"} 
-        verbose : bool, Optional
-            if True, VLM generated text will be printed in terminal in real-time.
-        stream : bool, Optional
-            if True, returns a generator that yields the output in real-time.
-        messages_logger: MessagesLogger, Optional
-            a messages logger that logs the messages.
-
-        Returns:
-        -------
-        response : Union[Dict[str,str], Generator[Dict[str, str], None, None]]
-            a dict {"reasoning": <reasoning>, "response": <response>} or Generator {"type": <reasoning or response>, "data": <content>}
-        """
+    def chat(self, messages:List[Dict[str,str]], verbose:bool=False, messages_logger:MessagesLogger=None) -> Dict[str,str]:
         processed_messages = self.config.preprocess_messages(messages)
         
-        if stream:
-            def _stream_generator():
-                response_stream = self.litellm.completion(
-                    model=self.model,
-                    messages=processed_messages,
-                    stream=True,
-                    base_url=self.base_url,
-                    api_key=self.api_key,
-                    **self.formatted_params
-                )
-                res_text = ""
-                for chunk in response_stream:
-                    chunk_content = chunk.get('choices')[0].get('delta').get('content')
-                    if chunk_content:
-                        res_text += chunk_content
-                        yield chunk_content
-
-                # Postprocess response
-                res_dict = self.config.postprocess_response(res_text)
-                # Write to messages log
-                if messages_logger:
-                    # replace images content with a placeholder "[image]" to save space
-                    if not messages_logger.store_images:
-                        for messages in processed_messages:
-                            if "content" in messages and isinstance(messages["content"], list):
-                                for content in messages["content"]:
-                                    if isinstance(content, dict) and content.get("type") == "image_url":
-                                        content["image_url"]["url"] = "[image]"
-
-                    processed_messages.append({"role": "assistant",
-                                                "content": res_dict.get("response", ""),
-                                                "reasoning": res_dict.get("reasoning", "")})
-                    messages_logger.log_messages(processed_messages)
-
-            return self.config.postprocess_response(_stream_generator())
-
-        elif verbose:
+        if verbose:
             response = self.litellm.completion(
                 model=self.model,
                 messages=processed_messages,
@@ -952,6 +935,7 @@ class LiteLLMInferenceEngine(InferenceEngine):
                 if chunk_content:
                     res += chunk_content
                     print(chunk_content, end='', flush=True)
+            print('\n')
         
         else:
             response = self.litellm.completion(
@@ -964,29 +948,35 @@ class LiteLLMInferenceEngine(InferenceEngine):
                 )
             res = response.choices[0].message.content
 
-        # Postprocess response
         res_dict = self.config.postprocess_response(res)
-        # Write to messages log
-        if messages_logger:
-            # replace images content with a placeholder "[image]" to save space
-            if not messages_logger.store_images:
-                for messages in processed_messages:
-                    if "content" in messages and isinstance(messages["content"], list):
-                        for content in messages["content"]:
-                            if isinstance(content, dict) and content.get("type") == "image_url":
-                                content["image_url"]["url"] = "[image]"
-
-            processed_messages.append({"role": "assistant", 
-                                        "content": res_dict.get("response", ""), 
-                                        "reasoning": res_dict.get("reasoning", "")})
-            messages_logger.log_messages(processed_messages)
-
+        self._log_messages(processed_messages, res_dict, messages_logger)
         return res_dict
+
+    def chat_stream(self, messages:List[Dict[str,str]], messages_logger:MessagesLogger=None) -> Generator[Dict[str, str], None, None]:
+        processed_messages = self.config.preprocess_messages(messages)
+        
+        def _stream_generator():
+            response_stream = self.litellm.completion(
+                model=self.model,
+                messages=processed_messages,
+                stream=True,
+                base_url=self.base_url,
+                api_key=self.api_key,
+                **self.formatted_params
+            )
+            res_text = ""
+            for chunk in response_stream:
+                chunk_content = chunk.get('choices')[0].get('delta').get('content')
+                if chunk_content:
+                    res_text += chunk_content
+                    yield chunk_content
+
+            res_dict = self.config.postprocess_response(res_text)
+            self._log_messages(processed_messages, res_dict, messages_logger)
+
+        return self.config.postprocess_response(_stream_generator())
     
     async def chat_async(self, messages:List[Dict[str,str]], messages_logger:MessagesLogger=None) -> Dict[str,str]:
-        """
-        Async version of chat method. Streaming is not supported.
-        """
         if self.concurrency_limiter:
             await self.concurrency_limiter.acquire()
         try:
@@ -1005,27 +995,59 @@ class LiteLLMInferenceEngine(InferenceEngine):
             )
             
             res = response.get('choices')[0].get('message').get('content')
-
-            # Postprocess response
             res_dict = self.config.postprocess_response(res)
-            # Write to messages log
-            if messages_logger:
-                # replace images content with a placeholder "[image]" to save space
-                if not messages_logger.store_images:
-                    for messages in processed_messages:
-                        if "content" in messages and isinstance(messages["content"], list):
-                            for content in messages["content"]:
-                                if isinstance(content, dict) and content.get("type") == "image_url":
-                                    content["image_url"]["url"] = "[image]"
-
-                processed_messages.append({"role": "assistant", 
-                                        "content": res_dict.get("response", ""), 
-                                        "reasoning": res_dict.get("reasoning", "")})
-                messages_logger.log_messages(processed_messages)
+            self._log_messages(processed_messages, res_dict, messages_logger)
             return res_dict
         finally:
             if self.concurrency_limiter:
                 self.concurrency_limiter.release()
+
+    async def chat_async_stream(self, messages:List[Dict[str,str]], messages_logger:MessagesLogger=None) -> AsyncGenerator[Dict[str, str], None]:
+        if self.concurrency_limiter:
+            await self.concurrency_limiter.acquire()
+
+        async def _stream_generator():
+            try:
+                if self.rate_limiter:
+                    await self.rate_limiter.acquire()
+                processed_messages = self.config.preprocess_messages(messages)
+
+                response_stream = await self.litellm.acompletion(
+                    model=self.model,
+                    messages=processed_messages,
+                    stream=True,
+                    base_url=self.base_url,
+                    api_key=self.api_key,
+                    **self.formatted_params
+                )
+                res_text = ""
+                async for chunk in response_stream:
+                    chunk_content = chunk.get('choices')[0].get('delta').get('content')
+                    if chunk_content:
+                        res_text += chunk_content
+                        yield chunk_content
+
+                res_dict = self.config.postprocess_response(res_text)
+                self._log_messages(processed_messages, res_dict, messages_logger)
+            finally:
+                if self.concurrency_limiter:
+                    self.concurrency_limiter.release()
+
+        return self.config.postprocess_response(_stream_generator())
+
+    def _log_messages(self, processed_messages: List[Dict[str, str]], res_dict: Dict[str, str], messages_logger: MessagesLogger):
+        if messages_logger:
+            if not messages_logger.store_images:
+                for messages in processed_messages:
+                    if "content" in messages and isinstance(messages["content"], list):
+                        for content in messages["content"]:
+                            if isinstance(content, dict) and content.get("type") == "image_url":
+                                content["image_url"]["url"] = "[image]"
+
+            processed_messages.append({"role": "assistant", 
+                                        "content": res_dict.get("response", ""), 
+                                        "reasoning": res_dict.get("reasoning", "")})
+            messages_logger.log_messages(processed_messages)
 
 
 class OpenAICompatibleInferenceEngine(InferenceEngine):
@@ -1083,25 +1105,24 @@ class OpenAICompatibleInferenceEngine(InferenceEngine):
         """
         return NotImplemented
     
-    
     def _log_messages(self, processed_messages:List[Dict[str,str]], res_dict:Dict[str,str], messages_logger:MessagesLogger):
-        """Helper method to log messages."""
-        if not messages_logger.store_images:
-            for msg in processed_messages:
-                if "content" in msg and isinstance(msg["content"], list):
-                    for content in msg["content"]:
-                        if isinstance(content, dict) and content.get("type") == "image_url":
-                            content["image_url"]["url"] = "[image]"
+        if messages_logger:
+            if not messages_logger.store_images:
+                for msg in processed_messages:
+                    if "content" in msg and isinstance(msg["content"], list):
+                        for content in msg["content"]:
+                            if isinstance(content, dict) and content.get("type") == "image_url":
+                                content["image_url"]["url"] = "[image]"
 
-        processed_messages.append({
-            "role": "assistant", 
-            "content": res_dict.get("response", ""), 
-            "reasoning": res_dict.get("reasoning", ""),
-            "tool_calls": res_dict.get("tool_calls", None)
-        })
-        messages_logger.log_messages(processed_messages)
+            processed_messages.append({
+                "role": "assistant", 
+                "content": res_dict.get("response", ""), 
+                "reasoning": res_dict.get("reasoning", ""),
+                "tool_calls": res_dict.get("tool_calls", None)
+            })
+            messages_logger.log_messages(processed_messages)
 
-    def _chat_stream(self, processed_messages:List[Dict[str,str]], **kwargs) -> Generator[Dict[str, Any], None, Dict[str, Any]]:
+    def _chat_stream_helper(self, processed_messages:List[Dict[str,str]], **kwargs) -> Generator[Dict[str, Any], None, Dict[str, Any]]:
         """
         Helper method for streaming chat responses. Can be overridden by child classes
         to handle backend-specific streaming behavior.
@@ -1133,54 +1154,37 @@ class OpenAICompatibleInferenceEngine(InferenceEngine):
                     warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
         
         return agg_response
-
-    def chat(self, messages:List[Dict[str,str]], verbose:bool=False, stream:bool=False, messages_logger:MessagesLogger=None, **kwargs) -> Union[Dict[str, str], Generator[Dict[str, str], None, None]]:
+    
+    async def _chat_async_stream_helper(self, processed_messages:List[Dict[str,str]], **kwargs) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        This method inputs chat messages and outputs LLM generated text.
-
-        Parameters:
-        ----------
-        messages : List[Dict[str,str]]
-            a list of dict with role and content. role must be one of {"system", "user", "assistant"}
-        verbose : bool, Optional
-            if True, VLM generated text will be printed in terminal in real-time.
-        stream : bool, Optional
-            if True, returns a generator that yields the output in real-time.
-        messages_logger : MessagesLogger, Optional
-            the message logger that logs the chat messages.
-
-        Returns:
-        -------
-        response : Union[Dict[str,str], Generator[Dict[str, str], None, None]]
-            a dict {"reasoning": <reasoning>, "response": <response>} or Generator {"type": <reasoning or response>, "data": <content>}
+        Async Helper method for streaming chat responses. Can be overridden by child classes.
         """
+        response_stream = await self.async_client.chat.completions.create(
+            model=self.model,
+            messages=processed_messages,
+            stream=True,
+            **self.formatted_params,
+            **kwargs
+        )
+        
+        # NOTE: Unlike sync generator, we can't easily return agg_response. 
+        # The aggregation must be handled by the consumer (chat_async_stream).
+        async for chunk in response_stream:
+            if len(chunk.choices) > 0:
+                chunk_dict = self._format_response(chunk)
+                yield chunk_dict
+                
+                if chunk.choices[0].finish_reason == "length":
+                    warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
+
+    def chat(self, messages:List[Dict[str,str]], verbose:bool=False, messages_logger:MessagesLogger=None, **kwargs) -> Dict[str, str]:
         processed_messages = self.config.preprocess_messages(messages)
 
-        if stream:
-            def _stream_generator():
-                stream_gen = self._chat_stream(processed_messages, **kwargs)
-                agg_response = None
-                
-                try:
-                    while True:
-                        chunk_dict = next(stream_gen)
-                        yield chunk_dict
-                except StopIteration as e:
-                    agg_response = e.value 
-                
-                # Postprocess and log
-                agg_response = agg_response if agg_response is not None else {"reasoning": "", "response": "", "tool_calls": []}
-                res_dict = self.config.postprocess_response(agg_response)
-                if messages_logger:
-                    self._log_messages(processed_messages, res_dict, messages_logger)
-
-            return self.config.postprocess_response(_stream_generator())
-
-        elif verbose:
+        if verbose:
             phase = ""
             agg_response = None
             
-            stream_gen = self._chat_stream(processed_messages, **kwargs)
+            stream_gen = self._chat_stream_helper(processed_messages, **kwargs)
             
             try:
                 while True:
@@ -1188,7 +1192,6 @@ class OpenAICompatibleInferenceEngine(InferenceEngine):
                     chunk_type = chunk_dict["type"]
                     chunk_data = chunk_dict["data"]
                     
-                    # Print with phase headers
                     if phase != chunk_type and chunk_data != "":
                         print(f"\n--- {chunk_type.capitalize()} ---")
                         phase = chunk_type
@@ -1199,12 +1202,12 @@ class OpenAICompatibleInferenceEngine(InferenceEngine):
                     else:
                         print(chunk_data, end="", flush=True)
             except StopIteration as e:
-                agg_response = e.value  # Capture the return value here!
+                agg_response = e.value
             
             print('\n')
             agg_response = agg_response if agg_response is not None else {"reasoning": "", "response": "", "tool_calls": []}
-            formatted_response = agg_response
-
+            res_dict = self.config.postprocess_response(agg_response)
+        
         else:
             chat_completion = self.client.chat.completions.create(
                 model=self.model,
@@ -1218,21 +1221,34 @@ class OpenAICompatibleInferenceEngine(InferenceEngine):
                 warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
 
             formatted_response = self._format_response(chat_completion)
-            
-        # Postprocess response by config
-        res_dict = self.config.postprocess_response(formatted_response)
+            res_dict = self.config.postprocess_response(formatted_response)
         
-        # Write to messages log
         if messages_logger:
             self._log_messages(processed_messages, res_dict, messages_logger)
 
         return res_dict
-    
 
+    def chat_stream(self, messages:List[Dict[str,str]], messages_logger:MessagesLogger=None, **kwargs) -> Generator[Dict[str, str], None, None]:
+        processed_messages = self.config.preprocess_messages(messages)
+
+        def _stream_generator():
+            stream_gen = self._chat_stream_helper(processed_messages, **kwargs)
+            agg_response = None
+            try:
+                while True:
+                    chunk_dict = next(stream_gen)
+                    yield chunk_dict
+            except StopIteration as e:
+                agg_response = e.value 
+            
+            agg_response = agg_response if agg_response is not None else {"reasoning": "", "response": "", "tool_calls": []}
+            res_dict = self.config.postprocess_response(agg_response)
+            if messages_logger:
+                self._log_messages(processed_messages, res_dict, messages_logger)
+
+        return self.config.postprocess_response(_stream_generator())
+    
     async def chat_async(self, messages:List[Dict[str,str]], messages_logger:MessagesLogger=None, **kwargs) -> Dict[str,str]:
-        """
-        Async version of chat method. Streaming is not supported.
-        """
         if self.concurrency_limiter:
             await self.concurrency_limiter.acquire()
         try:
@@ -1261,6 +1277,38 @@ class OpenAICompatibleInferenceEngine(InferenceEngine):
         finally:
             if self.concurrency_limiter:
                 self.concurrency_limiter.release()
+
+    async def chat_async_stream(self, messages:List[Dict[str,str]], messages_logger:MessagesLogger=None, **kwargs) -> AsyncGenerator[Dict[str, str], None]:
+        if self.concurrency_limiter:
+            await self.concurrency_limiter.acquire()
+
+        async def _stream_generator():
+            try:
+                if self.rate_limiter:
+                    await self.rate_limiter.acquire()
+                processed_messages = self.config.preprocess_messages(messages)
+
+                agg_response = {"reasoning": "", "response": "", "tool_calls": []}
+                
+                async for chunk_dict in self._chat_async_stream_helper(processed_messages, **kwargs):
+                    yield chunk_dict
+                    
+                    if chunk_dict.get("type") == "reasoning":
+                        agg_response["reasoning"] += chunk_dict["data"]
+                    elif chunk_dict.get("type") == "response":
+                        agg_response["response"] += chunk_dict["data"]
+                    elif chunk_dict.get("type") == "tool_calls":
+                        agg_response["tool_calls"].extend(chunk_dict["data"])
+                
+                res_dict = self.config.postprocess_response(agg_response)
+                if messages_logger:
+                    self._log_messages(processed_messages, res_dict, messages_logger)
+            finally:
+                if self.concurrency_limiter:
+                    self.concurrency_limiter.release()
+
+        return self.config.postprocess_response(_stream_generator())
+
 
 class VLLMInferenceEngine(OpenAICompatibleInferenceEngine):
     def __init__(self, model:str, api_key:str="", base_url:str="http://localhost:8000/v1", config:LLMConfig=None, 
@@ -1330,9 +1378,9 @@ class VLLMInferenceEngine(OpenAICompatibleInferenceEngine):
             "tool_calls": tool_calls
         }
 
-    def _chat_stream(self, processed_messages: List[Dict[str, str]], **kwargs) -> Generator[Dict[str, Any], None, Dict[str, Any]]:
+    def _chat_stream_helper(self, processed_messages: List[Dict[str, str]], **kwargs) -> Generator[Dict[str, Any], None, Dict[str, Any]]:
         """
-        Override parent's _chat_stream to handle vLLM's incremental tool call streaming.
+        Override parent's _chat_stream_helper to handle vLLM's incremental tool call streaming.
         vLLM sends tool calls in multiple chunks that need to be accumulated.
         """
         response_stream = self.client.chat.completions.create(
@@ -1344,7 +1392,7 @@ class VLLMInferenceEngine(OpenAICompatibleInferenceEngine):
         )
         
         agg_response = {"reasoning": "", "response": "", "tool_calls": []}
-        tool_call_accumulators = {}  # index -> {"id": str, "name": str, "arguments": str}
+        tool_call_accumulators = {}
         
         for chunk in response_stream:
             if len(chunk.choices) > 0:
@@ -1357,21 +1405,16 @@ class VLLMInferenceEngine(OpenAICompatibleInferenceEngine):
                         if idx not in tool_call_accumulators:
                             tool_call_accumulators[idx] = {"id": "", "name": "", "arguments": ""}
                         
-                        # Accumulate non-None values
                         if tc_delta["id"] is not None:
                             tool_call_accumulators[idx]["id"] = tc_delta["id"]
                         if tc_delta["name"] is not None:
                             tool_call_accumulators[idx]["name"] = tc_delta["name"]
                         if tc_delta["arguments"]:
                             tool_call_accumulators[idx]["arguments"] += tc_delta["arguments"]
-                    
-                    # Don't yield incremental tool call deltas
                     continue
                 
-                # Yield non-tool-call chunks normally
                 yield chunk_dict
                 
-                # Aggregate reasoning and response
                 if chunk_dict.get("type") == "reasoning":
                     agg_response["reasoning"] += chunk_dict["data"]
                 elif chunk_dict.get("type") == "response":
@@ -1382,18 +1425,62 @@ class VLLMInferenceEngine(OpenAICompatibleInferenceEngine):
         
         # After streaming completes, convert accumulated tool calls to final format
         if tool_call_accumulators:
-            # Sort by index to maintain order
             sorted_tool_calls = sorted(tool_call_accumulators.items(), key=lambda x: x[0])
             agg_response["tool_calls"] = [
                 {"name": tc["name"], "arguments": tc["arguments"]}
                 for idx, tc in sorted_tool_calls
             ]
-            # Yield the complete tool calls at the end
             yield {"type": "tool_calls", "data": agg_response["tool_calls"]}
         
         return agg_response
-        
     
+    async def _chat_async_stream_helper(self, processed_messages: List[Dict[str, str]], **kwargs) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Override parent's _chat_async_stream_helper to handle vLLM's incremental tool call streaming.
+        """
+        response_stream = await self.async_client.chat.completions.create(
+            model=self.model,
+            messages=processed_messages,
+            stream=True,
+            **self.formatted_params,
+            **kwargs
+        )
+        
+        tool_call_accumulators = {}
+        
+        async for chunk in response_stream:
+            if len(chunk.choices) > 0:
+                chunk_dict = self._format_response(chunk)
+                
+                # Handle incremental tool call deltas
+                if chunk_dict.get("type") == "tool_call_delta":
+                    for tc_delta in chunk_dict["data"]:
+                        idx = tc_delta["index"]
+                        if idx not in tool_call_accumulators:
+                            tool_call_accumulators[idx] = {"id": "", "name": "", "arguments": ""}
+                        
+                        if tc_delta["id"] is not None:
+                            tool_call_accumulators[idx]["id"] = tc_delta["id"]
+                        if tc_delta["name"] is not None:
+                            tool_call_accumulators[idx]["name"] = tc_delta["name"]
+                        if tc_delta["arguments"]:
+                            tool_call_accumulators[idx]["arguments"] += tc_delta["arguments"]
+                    continue
+                
+                yield chunk_dict
+                
+                if chunk.choices[0].finish_reason == "length":
+                    warnings.warn("Model stopped generating due to context length limit.", RuntimeWarning)
+        
+        # After streaming completes, yield accumulated tool calls
+        if tool_call_accumulators:
+            sorted_tool_calls = sorted(tool_call_accumulators.items(), key=lambda x: x[0])
+            tool_calls = [
+                {"name": tc["name"], "arguments": tc["arguments"]}
+                for idx, tc in sorted_tool_calls
+            ]
+            yield {"type": "tool_calls", "data": tool_calls}
+
 
 class SGLangInferenceEngine(OpenAICompatibleInferenceEngine):
     def __init__(self, model:str, api_key:str="", base_url:str="http://localhost:30000/v1", config:LLMConfig=None, 
@@ -1498,7 +1585,7 @@ class OpenRouterInferenceEngine(OpenAICompatibleInferenceEngine):
         if isinstance(response, self.ChatCompletionChunk):
             delta = response.choices[0].delta
             
-            # Tool calls - SGLang returns complete tool call in single chunk
+            # Tool calls
             if hasattr(delta, "tool_calls") and getattr(delta, "tool_calls") is not None:
                 if isinstance(delta.tool_calls, list):
                     tool_calls = []
@@ -1530,4 +1617,3 @@ class OpenRouterInferenceEngine(OpenAICompatibleInferenceEngine):
                 tool_calls.append({"name": function.name, "arguments": function.arguments})
         
         return {"response": response_text, "reasoning": reasoning, "tool_calls": tool_calls}
-    
