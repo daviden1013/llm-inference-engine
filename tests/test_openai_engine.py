@@ -22,7 +22,7 @@ class TestOpenAIEngine:
 
     def test_openai_chat_stream(self, gpt_engine):
         messages = [{"role": "user", "content": "List 3 colors"}]
-        stream = gpt_engine.chat(messages, stream=True)
+        stream = gpt_engine.chat_stream(messages)
         
         full_text = ""
         for chunk in stream:
@@ -37,6 +37,20 @@ class TestOpenAIEngine:
         response = await gpt_engine.chat_async(messages)
         print(f"\n[Async] Response: {response['response']}")
         assert len(response["response"]) > 0
+
+    @pytest.mark.asyncio
+    async def test_openai_chat_async_stream(self, gpt_engine):
+        """Test the new async streaming capability."""
+        messages = [{"role": "user", "content": "Count to 3"}]
+        stream = await gpt_engine.chat_async_stream(messages)
+        
+        full_text = ""
+        async for chunk in stream:
+            full_text += chunk["data"]
+            
+        print(f"\n[Async Stream] Full Text: {full_text}")
+        assert len(full_text) > 0
+        assert "1" in full_text or "one" in full_text.lower()
 
     @pytest.mark.asyncio
     async def test_openai_reasoning_model(self):
